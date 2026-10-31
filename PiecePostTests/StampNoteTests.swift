@@ -34,4 +34,15 @@ struct StampNoteTests {
         let input = String(repeating: "가", count: 49) + " 나"
         #expect(StampNote.normalize(input) == String(repeating: "가", count: 49))
     }
+
+    // MARK: 입력 중 제한
+
+    @Test func limitInputKeepsSpacesWhileTyping() {
+        #expect(StampNote.limitInput(" 바다 ") == " 바다 ")
+    }
+
+    @Test func limitInputReplacesNewlinesAndCapsLength() {
+        #expect(StampNote.limitInput("바다\n산책") == "바다 산책")
+        #expect(StampNote.limitInput(String(repeating: "가", count: 60)).count == 50)
+    }
 }

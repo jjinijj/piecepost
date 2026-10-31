@@ -41,6 +41,11 @@ final class StampStore {
         return try context.fetch(descriptor).first
     }
 
+    /// 화면에서 썸네일·사진을 표시할 때 쓰는 파일 위치.
+    func fileURL(for relativePath: String) -> URL {
+        fileStore.url(for: relativePath)
+    }
+
     @discardableResult
     func create(date: String, note: String, photo: ProcessedPhoto, now: Date = .now) throws -> Stamp {
         guard StampDate.isValid(date) else { throw StampStoreError.invalidDate }

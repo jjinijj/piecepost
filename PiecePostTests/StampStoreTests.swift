@@ -177,6 +177,11 @@ struct StampStoreTests {
 
     // MARK: 조회
 
+    @Test func fileURLPointsToStoredThumbnail() throws {
+        let stamp = try makeStamp()
+        #expect(try Data(contentsOf: store.fileURL(for: stamp.thumbnailPath)) == samplePhoto.thumbnail)
+    }
+
     @Test func visibleStampsAreSortedNewestFirst() throws {
         try makeStamp(date: "2026-11-01")
         try makeStamp(date: "2026-11-18")
