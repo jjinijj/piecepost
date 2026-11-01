@@ -243,6 +243,7 @@ final class StampSyncEngine {
                 case .updated: updated += 1
                 case .conflictServerWon, .conflictLocalWon: conflicts += 1
                 case .skippedPendingDeletion: skippedDeletion += 1
+                case .skippedStaleResult: break  // 보낸 결과 판정에서만 나온다
                 }
                 followUpReceive(outcome, recordID: record.recordID)
                 applied.append(record.recordID.recordName)
@@ -287,7 +288,7 @@ final class StampSyncEngine {
         case .conflictLocalWon(let resendsPhoto):
             log.add(resendsPhoto ? "받기 충돌: 로컬 채택, 사진도 다시 보냄" : "받기 충돌: 로컬 채택")
             engine?.state.add(pendingRecordZoneChanges: [.saveRecord(recordID)])
-        case .inserted, .updated, .skippedPendingDeletion:
+        case .inserted, .updated, .skippedPendingDeletion, .skippedStaleResult:
             break
         }
     }
@@ -392,8 +393,8 @@ final class StampSyncEngine {
 
         for failure in sent.failedRecordSaves {
             let id = failure.record.recordID
-            sentInfo.removeValue(forKey: id)
-            handleFailedSave(id: id, error: failure.error, engine: engine)
+            let info = sentInfo.removeValue(forKey: id)
+            handleFailedSave(id: id, error: failure.error, sentInfo: info, engine: engine)
         }
 
         for (_, error) in sent.failedRecordDeletes {
@@ -407,7 +408,7 @@ final class StampSyncEngine {
         )
     }
 
-    private func handleFailedSave(id: CKRecord.ID, error: CKError, engine: CKSyncEngine) {
+    private func handleFailedSave(id: CKRecord.ID, error: CKError, sentInfo: SentInfo?, engine: CKSyncEngine) {
         switch error.code {
         case .zoneNotFound:
             // 존을 만들고 다시 보낸다.
@@ -427,7 +428,7 @@ final class StampSyncEngine {
             log.add("저장 실패(재시도 대기): \(Self.describe(error))")
 
         case .serverRecordChanged:
-            resolveSaveConflict(id: id, error: error, engine: engine)
+            resolveSaveConflict(id: id, error: error, sentInfo: sentInfo, engine: engine)
 
         case .quotaExceeded:
             monitor.status = .quotaExceeded
@@ -445,7 +446,14 @@ final class StampSyncEngine {
     }
 
     /// `updatedAt`이 늦은 쪽을 남긴다. 로그에는 상태만 남긴다(날짜·내용·레코드 이름 금지).
-    private func resolveSaveConflict(id: CKRecord.ID, error: CKError, engine: CKSyncEngine) {
+    private func resolveSaveConflict(id: CKRecord.ID, error: CKError, sentInfo: SentInfo?, engine: CKSyncEngine) {
+        guard let sentInfo else {
+            // 보낼 때 기준을 모르면 옛 결과인지 가릴 수 없다. 판정하지 않고 다시 보내 새 결과로 판정한다.
+            // 보낼 변경이 없으면 보낼 값이 nil이라 예약에서 빠진다.
+            log.add("충돌 serverRecordChanged: 보낸 정보 없음, 다시 보냄")
+            engine.state.add(pendingRecordZoneChanges: [.saveRecord(id)])
+            return
+        }
         // 오류에 서버 레코드가 없거나 읽을 수 없으면(사진 Asset이 빠진 경우 포함) 직접 다시 받아
         // 받기 충돌 규칙으로 처리한다. 다시 받아도 형식이 잘못됐으면 다시 받기에서 건너뛴다.
         guard let serverRecord = error.serverRecord,
@@ -457,7 +465,7 @@ final class StampSyncEngine {
             return
         }
         do {
-            switch try applier.resolveSaveConflict(server: server) {
+            switch try applier.resolveSaveConflict(server: server, sentBaseSystemFields: sentInfo.baseSystemFields) {
             case .conflictLocalWon(let resendsPhoto):
                 log.add(resendsPhoto
                     ? "충돌 serverRecordChanged: 로컬 채택, 사진도 다시 보냄"
@@ -468,6 +476,10 @@ final class StampSyncEngine {
                 engine.state.remove(pendingRecordZoneChanges: [.saveRecord(id)])
             case .skippedPendingDeletion:
                 log.add("충돌 serverRecordChanged: 로컬 삭제 대기, 삭제 우선")
+            case .skippedStaleResult:
+                // 로컬이 이미 더 새 상태. 보낼 변경이 남아 있으면 지금 기준으로 다시 보내고, 없으면 예약에서 빠진다.
+                log.add("충돌 serverRecordChanged: 옛 결과, 반영 안 함")
+                engine.state.add(pendingRecordZoneChanges: [.saveRecord(id)])
             }
         } catch {
             // 사진 복사·저장 실패처럼 다시 하면 될 수 있는 실패. 다시 받아 받기 충돌 규칙으로 처리한다.

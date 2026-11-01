@@ -234,7 +234,8 @@ struct SyncChangeApplierTests {
         let serverFields = realSystemFields()
 
         let outcome = try applier.resolveSaveConflict(
-            server: try received(note: "서버", updatedAt: later, photo: serverPhoto.photo, systemFields: serverFields)
+            server: try received(note: "서버", updatedAt: later, photo: serverPhoto.photo, systemFields: serverFields),
+            sentBaseSystemFields: Data([1])
         )
 
         #expect(outcome == .conflictLocalWon(resendsPhoto: false))
@@ -264,7 +265,8 @@ struct SyncChangeApplierTests {
         try store.updateNote(date: "2026-11-18", note: "로컬 수정", now: evenLater)
 
         let outcome = try applier.resolveSaveConflict(
-            server: try received(updatedAt: later, photo: Data([9, 9]), systemFields: realSystemFields())
+            server: try received(updatedAt: later, photo: Data([9, 9]), systemFields: realSystemFields()),
+            sentBaseSystemFields: Data([1])
         )
 
         #expect(outcome == .conflictLocalWon(resendsPhoto: true))
@@ -280,7 +282,8 @@ struct SyncChangeApplierTests {
         let local = try store.create(date: "2026-11-18", note: "A", photo: localPhoto, now: evenLater)
 
         let outcome = try applier.resolveSaveConflict(
-            server: try received(note: "B", updatedAt: later, systemFields: realSystemFields())
+            server: try received(note: "B", updatedAt: later, systemFields: realSystemFields()),
+            sentBaseSystemFields: nil
         )
 
         #expect(outcome == .conflictLocalWon(resendsPhoto: false))
@@ -293,7 +296,9 @@ struct SyncChangeApplierTests {
         let local = try store.create(date: "2026-11-18", note: "A", photo: localPhoto, now: later)
         let oldPaths = [local.photoPath, local.thumbnailPath]
 
-        let outcome = try applier.resolveSaveConflict(server: try received(note: "B", updatedAt: evenLater))
+        let outcome = try applier.resolveSaveConflict(
+            server: try received(note: "B", updatedAt: evenLater), sentBaseSystemFields: nil
+        )
 
         #expect(outcome == .conflictServerWon)
         #expect(local.note == "B" && local.updatedAt == evenLater)
@@ -311,7 +316,9 @@ struct SyncChangeApplierTests {
     @Test func saveConflictWithSameTimestampTakesServer() throws {
         let local = try store.create(date: "2026-11-18", note: "A", photo: localPhoto, now: later.addingTimeInterval(0.0004))
 
-        let outcome = try applier.resolveSaveConflict(server: try received(note: "B", updatedAt: later))
+        let outcome = try applier.resolveSaveConflict(
+            server: try received(note: "B", updatedAt: later), sentBaseSystemFields: nil
+        )
 
         #expect(outcome == .conflictServerWon)
         #expect(local.note == "B" && !local.needsUpload)
@@ -321,7 +328,9 @@ struct SyncChangeApplierTests {
         try uploadedStamp()
         try store.delete(date: "2026-11-18")
 
-        #expect(try applier.resolveSaveConflict(server: try received(updatedAt: evenLater)) == .skippedPendingDeletion)
+        #expect(try applier.resolveSaveConflict(
+            server: try received(updatedAt: evenLater), sentBaseSystemFields: Data([1])
+        ) == .skippedPendingDeletion)
 
         let local = try #require(try stamp())
         #expect(local.pendingDeletion && local.needsUpload)
@@ -329,8 +338,67 @@ struct SyncChangeApplierTests {
     }
 
     @Test func saveConflictForMissingRowDoesNothing() throws {
-        #expect(try applier.resolveSaveConflict(server: try received()) == .skippedPendingDeletion)
+        #expect(try applier.resolveSaveConflict(server: try received(), sentBaseSystemFields: nil) == .skippedPendingDeletion)
         #expect(try stamp() == nil)
+    }
+
+    @Test func lateSaveConflictDoesNotRevertNewerReceivedRecord() throws {
+        // 로컬 v1을 보내는 중 → 서버 v3을 받아 서버 채택 → 먼저 보낸 v1의 실패 결과(서버 v2)가 늦게 도착
+        let v1 = created
+        let v2 = later
+        let v3 = evenLater
+        let local = try store.create(date: "2026-11-18", note: "v1", photo: localPhoto, now: v1)
+        let sentBase = local.systemFields  // v1을 보낼 때 기준(처음 올림 → nil)
+
+        #expect(try applier.applyReceived(
+            try received(note: "v3", updatedAt: v3, photo: Data([3]), systemFields: Data([33]))
+        ) == .conflictServerWon)
+        let v3Paths = [local.photoPath, local.thumbnailPath]
+
+        let outcome = try applier.resolveSaveConflict(
+            server: try received(note: "v2", updatedAt: v2, photo: Data([2]), systemFields: Data([22])),
+            sentBaseSystemFields: sentBase
+        )
+
+        #expect(outcome == .skippedStaleResult)
+        #expect(local.note == "v3" && local.updatedAt == v3)
+        #expect(local.systemFields == Data([33]))
+        #expect(!local.needsUpload)
+        #expect([local.photoPath, local.thumbnailPath] == v3Paths)
+        #expect(try fileData(local.photoPath) == Data([3]))
+        #expect(try photoFileCount() == 1)
+        #expect(try applier.uploadValues(for: "2026-11-18") == nil)
+    }
+
+    @Test func lateSaveConflictDoesNotRevertSystemFieldsAfterLocalWon() throws {
+        // 로컬 수정을 보내는 중 → 서버 v2를 받았지만 로컬이 이겨 v2 기준으로 다시 보낼 예정
+        // → 먼저 보낸 것의 실패 결과(더 옛 서버 레코드)가 늦게 도착
+        let local = try uploadedStamp(photo: serverPhoto)
+        try store.updateNote(date: "2026-11-18", note: "로컬 수정", now: evenLater)
+        #expect(try applier.applyReceived(
+            try received(updatedAt: later, photo: serverPhoto.photo, systemFields: Data([22]))
+        ) == .conflictLocalWon(resendsPhoto: false))
+
+        let outcome = try applier.resolveSaveConflict(
+            server: try received(updatedAt: created, photo: serverPhoto.photo, systemFields: Data([11])),
+            sentBaseSystemFields: Data([1])
+        )
+
+        #expect(outcome == .skippedStaleResult)
+        #expect(local.note == "로컬 수정" && local.needsUpload)
+        #expect(try applier.uploadValues(for: "2026-11-18")?.systemFields == Data([22]))
+    }
+
+    @Test func saveConflictWithoutPendingChangeIgnoresOlderServerRecord() throws {
+        // 보낼 변경이 없는 우표에는 서버 쪽이 더 늦을 때만 반영한다
+        let local = try uploadedStamp()
+
+        let outcome = try applier.resolveSaveConflict(
+            server: try received(note: "옛 서버", updatedAt: created), sentBaseSystemFields: Data([1])
+        )
+
+        #expect(outcome == .skippedStaleResult)
+        #expect(local.note == "로컬" && local.systemFields == Data([1]))
     }
 
     // MARK: 보낸 결과

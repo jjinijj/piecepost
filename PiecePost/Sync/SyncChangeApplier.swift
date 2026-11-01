@@ -18,6 +18,8 @@ nonisolated enum ReceiveOutcome: Equatable, Sendable {
     case conflictLocalWon(resendsPhoto: Bool)
     /// 로컬에서 삭제 대기 중이라 건드리지 않음(삭제 우선).
     case skippedPendingDeletion
+    /// 늦게 도착한 옛 보내기 결과라 무시함. 로컬이 이미 더 새 서버 레코드를 반영했거나 보낸 뒤 바뀌었다.
+    case skippedStaleResult
 }
 
 /// CloudKit에서 받은 변경과 보낸 결과를 로컬 저장소에 반영하는 규칙.
@@ -103,15 +105,25 @@ final class SyncChangeApplier {
     ///
     /// 로컬 `updatedAt`이 늦으면 로컬을 유지하고 서버 레코드의 시스템 필드를 저장한다(호출하는 쪽이 다시 보낸다).
     /// 이르거나 같으면 서버 레코드를 반영하고 로컬의 보낼 변경을 없앤다.
-    /// - Returns: `.conflictLocalWon`, `.conflictServerWon`, 또는 로컬에 행이 없거나 삭제 대기면
-    ///   `.skippedPendingDeletion`(삭제 예약이 따로 있으므로 삭제 우선)
+    ///
+    /// 늦게 도착한 옛 실패 결과가 그사이 반영한 더 새 서버 레코드를 되돌리지 않도록, `markSaved`처럼
+    /// 보낼 때 기준으로 삼은 시스템 필드가 지금 로컬 값과 같을 때만 판정한다. 보낼 변경이 없는 우표는
+    /// 서버 쪽 `updatedAt`이 더 늦을 때만 반영한다.
+    /// - Parameter sentBaseSystemFields: 실패한 레코드를 만들 때 기준으로 삼은 `systemFields`(처음 올렸으면 nil)
+    /// - Returns: `.conflictLocalWon`, `.conflictServerWon`, 옛 결과면 `.skippedStaleResult`,
+    ///   로컬에 행이 없거나 삭제 대기면 `.skippedPendingDeletion`(삭제 예약이 따로 있으므로 삭제 우선)
     @discardableResult
-    func resolveSaveConflict(server: ReceivedStamp) throws -> ReceiveOutcome {
+    func resolveSaveConflict(server: ReceivedStamp, sentBaseSystemFields: Data?) throws -> ReceiveOutcome {
         guard let existing = try stamp(for: server.date), !existing.pendingDeletion else {
             return .skippedPendingDeletion
         }
-        if existing.needsUpload && Self.isLater(existing.updatedAt, than: server.updatedAt) {
-            return .conflictLocalWon(resendsPhoto: try keepLocal(existing, over: server))
+        guard existing.systemFields == sentBaseSystemFields else { return .skippedStaleResult }
+        if existing.needsUpload {
+            if Self.isLater(existing.updatedAt, than: server.updatedAt) {
+                return .conflictLocalWon(resendsPhoto: try keepLocal(existing, over: server))
+            }
+        } else if !Self.isLater(server.updatedAt, than: existing.updatedAt) {
+            return .skippedStaleResult
         }
         try replace(existing, with: server)
         return .conflictServerWon
