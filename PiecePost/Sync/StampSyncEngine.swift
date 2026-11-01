@@ -16,6 +16,8 @@ final class StampSyncEngine {
     private var engine: CKSyncEngine?
     private var database: CKDatabase?
     private var isRetryingReceives = false
+    /// 다시 받기가 도는 중에 새로 요청됐는지. 끝난 뒤 한 번 더 돌린다(그사이 목록에 들어온 것이 다음 계기까지 묻히지 않게).
+    private var receiveRetryRequestedWhileRunning = false
 
     /// 보낸 레코드의 결과를 받을 때 필요한 값. 결과 콜백에는 "보낼 때" 값이 없으므로 여기 기억해 둔다.
     private struct SentInfo {
@@ -302,13 +304,30 @@ final class StampSyncEngine {
         }
     }
 
-    /// 반영에 실패했던 레코드만 iCloud에서 직접 다시 받아 반영한다. 앱 시작과 가져오기 끝에 부른다.
+    /// 다시 받기 목록에 넣고 다음 계기를 기다리지 않고 바로 다시 받는다. 보내기 충돌을 처리하지 못했을 때 쓴다.
+    private func markForRetryAndStart(_ recordID: CKRecord.ID, error: any Error) {
+        markForRetry(recordID, error: error)
+        Task { await retryFailedReceives() }
+    }
+
+    /// 반영에 실패했던 레코드만 iCloud에서 직접 다시 받아 반영한다. 앱 시작, 가져오기 끝, 보내기 충돌 처리 실패 때 부른다.
     func retryFailedReceives() async {
-        guard !isRetryingReceives, let database else { return }
+        guard let database else { return }
+        guard !isRetryingReceives else {
+            receiveRetryRequestedWhileRunning = true
+            return
+        }
         let names = retryList.names()
         guard !names.isEmpty else { return }
         isRetryingReceives = true
-        defer { isRetryingReceives = false }
+        defer {
+            isRetryingReceives = false
+            // 도는 중에 들어온 요청은 한 번만 이어서 처리한다. 실패해 남은 것은 요청을 만들지 않으므로 반복되지 않는다.
+            if receiveRetryRequestedWhileRunning {
+                receiveRetryRequestedWhileRunning = false
+                Task { await retryFailedReceives() }
+            }
+        }
 
         log.add("반영 실패 \(names.count)건 다시 받기")
         let ids = names.map { CKRecord.ID(recordName: $0, zoneID: StampRecordMapper.zoneID) }
@@ -460,8 +479,7 @@ final class StampSyncEngine {
               let server = try? StampRecordMapper.receivedStamp(from: serverRecord)
         else {
             log.add("충돌 serverRecordChanged: 서버 레코드를 읽지 못함, 다시 받기")
-            markForRetry(id, error: error)
-            Task { await retryFailedReceives() }
+            markForRetryAndStart(id, error: error)
             return
         }
         do {
@@ -482,8 +500,9 @@ final class StampSyncEngine {
                 engine.state.add(pendingRecordZoneChanges: [.saveRecord(id)])
             }
         } catch {
-            // 사진 복사·저장 실패처럼 다시 하면 될 수 있는 실패. 다시 받아 받기 충돌 규칙으로 처리한다.
-            markForRetry(id, error: error)
+            // 사진 복사·저장 실패처럼 다시 하면 될 수 있는 실패. 바로 다시 받아 받기 충돌 규칙으로 처리한다.
+            // 다시 받기에서도 반영에 실패하면 목록에 남기만 하고 보내기를 예약하지 않으므로 반복되지 않는다.
+            markForRetryAndStart(id, error: error)
         }
     }
 
