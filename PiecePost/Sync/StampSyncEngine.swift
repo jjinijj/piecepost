@@ -446,19 +446,14 @@ final class StampSyncEngine {
 
     /// `updatedAt`이 늦은 쪽을 남긴다. 로그에는 상태만 남긴다(날짜·내용·레코드 이름 금지).
     private func resolveSaveConflict(id: CKRecord.ID, error: CKError, engine: CKSyncEngine) {
-        guard let serverRecord = error.serverRecord else {
-            // 비교할 서버 레코드가 없으면 직접 다시 받아 받기 충돌 규칙으로 처리한다.
-            log.add("충돌 serverRecordChanged: 서버 레코드 없음, 다시 받기")
+        // 오류에 서버 레코드가 없거나 읽을 수 없으면(사진 Asset이 빠진 경우 포함) 직접 다시 받아
+        // 받기 충돌 규칙으로 처리한다. 다시 받아도 형식이 잘못됐으면 다시 받기에서 건너뛴다.
+        guard let serverRecord = error.serverRecord,
+              let server = try? StampRecordMapper.receivedStamp(from: serverRecord)
+        else {
+            log.add("충돌 serverRecordChanged: 서버 레코드를 읽지 못함, 다시 받기")
             markForRetry(id, error: error)
             Task { await retryFailedReceives() }
-            return
-        }
-        let server: ReceivedStamp
-        do {
-            server = try StampRecordMapper.receivedStamp(from: serverRecord)
-        } catch {
-            // 형식이 잘못된 서버 레코드는 받기와 같이 건너뛴다. needsUpload는 남아 다음 실행 때 다시 시도된다.
-            log.add("충돌 serverRecordChanged: 서버 레코드 형식 오류, 건너뜀: \(Self.describe(error))")
             return
         }
         do {
