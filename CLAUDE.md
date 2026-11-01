@@ -50,6 +50,7 @@
 ## 검증 (모든 수정 후 필수)
 1. 사용할 시뮬레이터 확인: `xcrun simctl list devices available`
 2. 빌드·테스트: `xcodebuild test -scheme PiecePost -destination 'platform=iOS Simulator,name=<1번에서 확인한 기기 이름>'`
+   - PR 안의 중간 커밋은 같은 명령에 `-only-testing:PiecePostTests`를 붙여 빌드와 단위 테스트만 확인함. PR의 마지막 커밋은 위 명령 그대로 UI 테스트까지 전체 실행
 3. 실패하면 통과할 때까지 수정. 통과 전에는 완료 보고 금지
 4. 동기화 관련 수정이면 → 자동 테스트로 확인할 수 없으므로 `docs/tasks/01-sync-spike.md`의 수동 확인 항목 중 해당하는 것을 보고에 체크리스트로 적음
 5. 스킴 이름이 `PiecePost`가 아니면 → 실제 스킴 이름을 확인해 이 파일의 명령을 고치자고 제안
