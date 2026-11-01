@@ -225,7 +225,7 @@ final class StampSyncEngine {
     // MARK: 받은 변경
 
     private func applyFetched(_ changes: CKSyncEngine.Event.FetchedRecordZoneChanges) {
-        var inserted = 0, updated = 0, skippedPending = 0, skippedDeletion = 0, deleted = 0, failed = 0, retryLater = 0
+        var inserted = 0, updated = 0, conflicts = 0, skippedDeletion = 0, deleted = 0, failed = 0, retryLater = 0
         var applied: [String] = []
 
         for modification in changes.modifications {
@@ -237,12 +237,14 @@ final class StampSyncEngine {
                     log.add("더 높은 schemaVersion=\(received.schemaVersion) 받음, 아는 필드만 반영")
                 }
                 // 사진 임시 파일은 이 콜백 안에서만 유효하므로 여기서 바로 복사한다.
-                switch try applier.applyReceived(received) {
+                let outcome = try applier.applyReceived(received)
+                switch outcome {
                 case .inserted: inserted += 1
                 case .updated: updated += 1
-                case .skippedLocalPending: skippedPending += 1
+                case .conflictServerWon, .conflictLocalWon: conflicts += 1
                 case .skippedPendingDeletion: skippedDeletion += 1
                 }
+                followUpReceive(outcome, recordID: record.recordID)
                 applied.append(record.recordID.recordName)
             } catch let error as StampRecordError {
                 // 형식이 잘못된 레코드는 다시 받아도 같으므로 건너뛴다(합의된 동작).
@@ -270,10 +272,24 @@ final class StampSyncEngine {
         // 다시 받기 목록에 있던 것이 정상으로 반영됐으면 목록에서 뺀다.
         try? retryList.remove(applied)
         log.add(
-            "받음: 추가 \(inserted), 갱신 \(updated), 삭제 \(deleted), "
-                + "건너뜀(로컬 대기 \(skippedPending), 삭제 대기 \(skippedDeletion)), "
+            "받음: 추가 \(inserted), 갱신 \(updated), 충돌 \(conflicts), 삭제 \(deleted), "
+                + "건너뜀(삭제 대기 \(skippedDeletion)), "
                 + "형식 오류 \(failed), 다시 받기 \(retryLater)"
         )
+    }
+
+    /// 받기 충돌 결과에 맞게 엔진의 보낼 목록을 맞춘다. 로그에는 상태만 남긴다(날짜·내용 금지).
+    private func followUpReceive(_ outcome: ReceiveOutcome, recordID: CKRecord.ID) {
+        switch outcome {
+        case .conflictServerWon:
+            log.add("받기 충돌: 서버 채택")
+            engine?.state.remove(pendingRecordZoneChanges: [.saveRecord(recordID)])
+        case .conflictLocalWon(let resendsPhoto):
+            log.add(resendsPhoto ? "받기 충돌: 로컬 채택, 사진도 다시 보냄" : "받기 충돌: 로컬 채택")
+            engine?.state.add(pendingRecordZoneChanges: [.saveRecord(recordID)])
+        case .inserted, .updated, .skippedPendingDeletion:
+            break
+        }
     }
 
     private func markForRetry(_ recordID: CKRecord.ID, error: any Error) {
@@ -310,7 +326,8 @@ final class StampSyncEngine {
             case .success(let record):
                 do {
                     // 사진 임시 파일이 사라지기 전에 바로 반영(복사)한다.
-                    try applier.applyReceived(try StampRecordMapper.receivedStamp(from: record))
+                    let outcome = try applier.applyReceived(try StampRecordMapper.receivedStamp(from: record))
+                    followUpReceive(outcome, recordID: id)
                     recovered += 1
                     finished.append(id.recordName)
                 } catch is StampRecordError {

@@ -13,7 +13,10 @@ struct SyncChangeApplierTests {
 
     private let created = Date(timeIntervalSince1970: 1_800_000_000)
     private let later = Date(timeIntervalSince1970: 1_800_000_600)
+    private let evenLater = Date(timeIntervalSince1970: 1_800_001_200)
     private let localPhoto = ProcessedPhoto(photo: Data([1, 1]), thumbnail: Data([2]))
+    /// `received()`의 기본 사진과 같은 내용
+    private let serverPhoto = ProcessedPhoto(photo: Data([7, 7, 7]), thumbnail: Data([8]))
 
     init() throws {
         let configuration = ModelConfiguration(isStoredInMemoryOnly: true, cloudKitDatabase: .none)
@@ -55,8 +58,12 @@ struct SyncChangeApplierTests {
 
     /// 서버에 올라간 적이 있고 보낼 변경이 없는 로컬 우표.
     @discardableResult
-    private func uploadedStamp(date: String = "2026-11-18", note: String = "로컬") throws -> Stamp {
-        let stamp = try store.create(date: date, note: note, photo: localPhoto, now: created)
+    private func uploadedStamp(
+        date: String = "2026-11-18",
+        note: String = "로컬",
+        photo: ProcessedPhoto? = nil
+    ) throws -> Stamp {
+        let stamp = try store.create(date: date, note: note, photo: photo ?? localPhoto, now: created)
         stamp.systemFields = Data([1])
         stamp.needsUpload = false
         stamp.photoNeedsUpload = false
@@ -70,6 +77,12 @@ struct SyncChangeApplierTests {
 
     private func fileData(_ path: String) throws -> Data {
         try Data(contentsOf: fileStore.url(for: path))
+    }
+
+    /// 앱 폴더에 남은 사진 파일 수. 밀린 쪽 파일이 남지 않았는지 볼 때 쓴다.
+    private func photoFileCount() throws -> Int {
+        let folder = fileStore.baseURL.appending(path: StampFileStore.photosFolder)
+        return try FileManager.default.contentsOfDirectory(atPath: folder.path(percentEncoded: false)).count
     }
 
     private func fileExists(_ path: String) -> Bool {
@@ -107,15 +120,77 @@ struct SyncChangeApplierTests {
         #expect(!oldPaths.contains(where: fileExists))
     }
 
-    @Test func receivedChangeDoesNotTouchLocalPendingUpload() throws {
+    // MARK: 받기 충돌 (로컬에 보낼 변경이 있을 때)
+
+    @Test func receivedLaterThanLocalPendingWinsAndDropsLocalChange() throws {
         let local = try uploadedStamp()
+        let oldPaths = [local.photoPath, local.thumbnailPath]
         try store.updateNote(date: "2026-11-18", note: "로컬 수정", now: later)
 
-        #expect(try applier.applyReceived(try received(note: "서버")) == .skippedLocalPending)
+        let outcome = try applier.applyReceived(try received(note: "서버", updatedAt: evenLater))
 
+        #expect(outcome == .conflictServerWon)
+        #expect(local.note == "서버")
+        #expect(local.updatedAt == evenLater)
+        #expect(local.systemFields == Data([42]))
+        #expect(!local.needsUpload && !local.photoNeedsUpload)
+        #expect(try fileData(local.photoPath) == Data([7, 7, 7]))
+        // 밀린 로컬 사진 파일은 지운다
+        #expect(!oldPaths.contains(where: fileExists))
+        #expect(try photoFileCount() == 1)
+        // 보낼 변경이 없어졌으므로 엔진에 예약이 남아 있어도 보내지 않는다
+        #expect(try applier.pendingChanges().isEmpty)
+        #expect(try applier.uploadValues(for: "2026-11-18") == nil)
+    }
+
+    @Test func localPendingLaterThanReceivedIsKeptWithNewSystemFields() throws {
+        let local = try uploadedStamp(photo: serverPhoto)
+        let paths = [local.photoPath, local.thumbnailPath]
+        try store.updateNote(date: "2026-11-18", note: "로컬 수정", now: evenLater)
+
+        let outcome = try applier.applyReceived(try received(note: "서버", updatedAt: later, photo: serverPhoto.photo))
+
+        #expect(outcome == .conflictLocalWon(resendsPhoto: false))
         #expect(local.note == "로컬 수정")
+        #expect(local.updatedAt == evenLater)
         #expect(local.needsUpload)
-        #expect(local.systemFields == Data([1]))
+        // 같은 사진이면 기록만 보낸다(불변 규칙 5)
+        #expect(!local.photoNeedsUpload)
+        // 다음 보내기는 받은 서버 레코드를 기준으로 한다
+        #expect(local.systemFields == Data([42]))
+        #expect(try applier.uploadValues(for: "2026-11-18")?.systemFields == Data([42]))
+        // 받은 사진은 복사하지 않는다
+        #expect([local.photoPath, local.thumbnailPath] == paths)
+        #expect(try photoFileCount() == 1)
+    }
+
+    @Test func localPendingWithSameTimestampIsKept() throws {
+        let local = try uploadedStamp(photo: serverPhoto)
+        try store.updateNote(date: "2026-11-18", note: "로컬 수정", now: later.addingTimeInterval(0.0004))
+
+        // CloudKit은 밀리초까지만 저장하므로 1ms 안의 차이는 같은 시각으로 본다
+        let outcome = try applier.applyReceived(try received(updatedAt: later, photo: serverPhoto.photo))
+
+        #expect(outcome == .conflictLocalWon(resendsPhoto: false))
+        #expect(local.note == "로컬 수정" && local.needsUpload)
+    }
+
+    @Test func localWinnerResendsPhotoWhenServerPhotoDiffers() throws {
+        // 다른 기기가 같은 날짜를 지우고 새 사진으로 다시 만든 사이, 이 기기는 기록만 고친 상황
+        let local = try uploadedStamp()
+        try store.updateNote(date: "2026-11-18", note: "로컬 수정", now: evenLater)
+
+        let outcome = try applier.applyReceived(try received(updatedAt: later, photo: Data([9, 9])))
+
+        #expect(outcome == .conflictLocalWon(resendsPhoto: true))
+        #expect(local.needsUpload && local.photoNeedsUpload)
+        #expect(try fileData(local.photoPath) == localPhoto.photo)
+        #expect(try applier.uploadValues(for: "2026-11-18")?.photoNeedsUpload == true)
+    }
+
+    @Test func uploadValuesAreNilWithoutPendingChange() throws {
+        try uploadedStamp()
+        #expect(try applier.uploadValues(for: "2026-11-18") == nil)
     }
 
     @Test func receivedChangeKeepsLocalPendingDeletion() throws {
