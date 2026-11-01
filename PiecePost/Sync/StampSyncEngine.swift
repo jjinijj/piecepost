@@ -68,6 +68,17 @@ final class StampSyncEngine {
         }
     }
 
+    /// 시뮬레이터처럼 푸시를 잘 받지 못하는 환경을 위한 수동 가져오기.
+    func fetchNow() async {
+        guard let engine else { return }
+        log.add("지금 가져오기 요청")
+        do {
+            try await engine.fetchChanges()
+        } catch {
+            log.add("가져오기 실패: \(Self.describe(error))")
+        }
+    }
+
     // MARK: 로컬 변경
 
     /// `StampStore.onLocalChange`에서 부른다.
@@ -122,12 +133,107 @@ final class StampSyncEngine {
                 log.add("엔진 상태 저장 실패: \(Self.describe(error))")
             }
 
+        case .accountChange(let change):
+            handleAccountChange(change, engine: engine)
+
+        case .fetchedDatabaseChanges(let changes):
+            for deletion in changes.deletions where deletion.zoneID == StampRecordMapper.zoneID {
+                // 합의: 로그만 남기고 로컬은 유지한다.
+                log.add("서버에서 존 삭제됨 reason=\(deletion.reason), 로컬 유지")
+            }
+
+        case .fetchedRecordZoneChanges(let changes):
+            applyFetched(changes)
+
+        case .sentDatabaseChanges(let sent):
+            if !sent.savedZones.isEmpty {
+                log.add("존 저장됨 \(sent.savedZones.count)개")
+            }
+            for failure in sent.failedZoneSaves {
+                log.add("존 저장 실패: \(Self.describe(failure.error))")
+            }
+
         case .sentRecordZoneChanges(let sent):
             applySent(sent, engine: engine)
 
-        default:
+        case .willFetchChanges:
+            monitor.status = .syncing
+            log.add("가져오기 시작")
+        case .didFetchChanges:
+            if monitor.status == .syncing { monitor.status = .idle }
+            log.add("가져오기 끝")
+        case .willSendChanges:
+            monitor.status = .syncing
+        case .didSendChanges:
+            if monitor.status == .syncing { monitor.status = .idle }
+
+        case .willFetchRecordZoneChanges, .didFetchRecordZoneChanges:
             break
+        @unknown default:
+            log.add("알 수 없는 엔진 이벤트")
         }
+    }
+
+    private func handleAccountChange(_ change: CKSyncEngine.Event.AccountChange, engine: CKSyncEngine) {
+        // 계정 상태 처리는 다음 PR(계정 상태)에서 정리한다. 지금은 로그와 상태 표시만.
+        switch change.changeType {
+        case .signIn:
+            log.add("계정 이벤트: 로그인")
+            monitor.status = .idle
+            if let pending = try? applier.pendingChanges() {
+                for item in pending { enqueue(item, in: engine) }
+            }
+        case .signOut:
+            log.add("계정 이벤트: 로그아웃")
+            monitor.status = .iCloudUnavailable
+        case .switchAccounts:
+            log.add("계정 이벤트: 계정 전환")
+            monitor.status = .iCloudUnavailable
+        @unknown default:
+            log.add("계정 이벤트: 알 수 없음")
+        }
+    }
+
+    // MARK: 받은 변경
+
+    private func applyFetched(_ changes: CKSyncEngine.Event.FetchedRecordZoneChanges) {
+        var inserted = 0, updated = 0, skippedPending = 0, skippedDeletion = 0, deleted = 0, failed = 0
+
+        for modification in changes.modifications {
+            let record = modification.record
+            guard record.recordID.zoneID == StampRecordMapper.zoneID else { continue }
+            do {
+                let received = try StampRecordMapper.receivedStamp(from: record)
+                if received.schemaVersion > Stamp.currentSchemaVersion {
+                    log.add("더 높은 schemaVersion=\(received.schemaVersion) 받음, 아는 필드만 반영")
+                }
+                // 사진 임시 파일은 이 콜백 안에서만 유효하므로 여기서 바로 복사한다.
+                switch try applier.applyReceived(received) {
+                case .inserted: inserted += 1
+                case .updated: updated += 1
+                case .skippedLocalPending: skippedPending += 1
+                case .skippedPendingDeletion: skippedDeletion += 1
+                }
+            } catch {
+                failed += 1
+                log.add("받은 레코드 건너뜀: \(Self.describe(error))")
+            }
+        }
+
+        for deletion in changes.deletions where deletion.recordType == StampRecordMapper.recordType {
+            guard let date = StampRecordMapper.date(from: deletion.recordID) else { continue }
+            do {
+                if try applier.applyServerDeletion(date: date) { deleted += 1 }
+            } catch {
+                failed += 1
+                log.add("받은 삭제 반영 실패: \(Self.describe(error))")
+            }
+        }
+
+        log.add(
+            "받음: 추가 \(inserted), 갱신 \(updated), 삭제 \(deleted), "
+                + "건너뜀(로컬 대기 \(skippedPending), 삭제 대기 \(skippedDeletion)), 실패 \(failed)"
+        )
     }
 
     // MARK: 보낸 결과
@@ -166,7 +272,7 @@ final class StampSyncEngine {
         for failure in sent.failedRecordSaves {
             let id = failure.record.recordID
             sentInfo.removeValue(forKey: id)
-            log.add("저장 실패: \(Self.describe(failure.error))")
+            handleFailedSave(id: id, error: failure.error, engine: engine)
         }
 
         for (_, error) in sent.failedRecordDeletes {
@@ -178,6 +284,44 @@ final class StampSyncEngine {
             "보냄: 저장 \(saved), 옛 결과 무시 \(ignored), 삭제 \(sent.deletedRecordIDs.count), "
                 + "실패 \(sent.failedRecordSaves.count + sent.failedRecordDeletes.count)"
         )
+    }
+
+    private func handleFailedSave(id: CKRecord.ID, error: CKError, engine: CKSyncEngine) {
+        switch error.code {
+        case .zoneNotFound:
+            // 존을 만들고 다시 보낸다.
+            log.add("저장 실패 zoneNotFound: 존 만들고 다시 보냄")
+            engine.state.add(pendingDatabaseChanges: [.saveZone(CKRecordZone(zoneID: StampRecordMapper.zoneID))])
+            engine.state.add(pendingRecordZoneChanges: [.saveRecord(id)])
+
+        case .unknownItem:
+            // 올렸는데 서버에 이미 없음 → 삭제 우선.
+            log.add("저장 실패 unknownItem: 로컬도 삭제")
+            if let date = StampRecordMapper.date(from: id) {
+                _ = try? applier.applyServerDeletion(date: date)
+            }
+
+        case .networkFailure, .networkUnavailable, .zoneBusy, .serviceUnavailable, .requestRateLimited:
+            // needsUpload를 유지하고 재시도는 엔진에 맡긴다.
+            log.add("저장 실패(재시도 대기): \(Self.describe(error))")
+
+        case .serverRecordChanged:
+            // 충돌 처리 PR에서 처리한다. needsUpload가 남아 있어 다음 실행 때 다시 시도된다.
+            log.add("저장 실패 serverRecordChanged: 충돌 처리 미구현, 로그만")
+
+        case .quotaExceeded:
+            monitor.status = .quotaExceeded
+            log.add("저장 실패 quotaExceeded: 로컬 유지")
+
+        case .notAuthenticated:
+            monitor.status = .iCloudUnavailable
+            log.add("저장 실패 notAuthenticated: 로컬에만 저장")
+
+        default:
+            // 판단 분기에 없는 코드. 처리 방식은 정하지 않고 보고한다.
+            monitor.status = .error(code: error.code.rawValue)
+            log.add("저장 실패(처리 방식 미정): \(Self.describe(error))")
+        }
     }
 
     // MARK: 로그용
