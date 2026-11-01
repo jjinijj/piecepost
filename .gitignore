@@ -2,3 +2,8 @@
 xcuserdata/
 DerivedData/
 *.xcuserstate
+
+# PM·개발자 파이프라인: 상태판과 Codex 리뷰 출력은 로컬 전용
+# (도구 출력에 절대 경로·로그가 섞여 맥 사용자 이름이 드러날 수 있음)
+docs/handoff.md
+docs/reviews/
