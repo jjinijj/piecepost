@@ -149,7 +149,7 @@ struct SyncChangeApplierTests {
     @Test func markSavedClearsUploadFlags() throws {
         let local = try store.create(date: "2026-11-18", note: "새로", photo: localPhoto, now: created)
 
-        try applier.markSaved(date: "2026-11-18", systemFields: Data([9]), sentUpdatedAt: created)
+        try applier.markSaved(date: "2026-11-18", systemFields: Data([9]), sentUpdatedAt: created, sentBaseSystemFields: nil)
 
         #expect(local.systemFields == Data([9]))
         #expect(!local.needsUpload)
@@ -158,7 +158,7 @@ struct SyncChangeApplierTests {
 
     @Test func markSavedToleratesMillisecondPrecision() throws {
         let local = try store.create(date: "2026-11-18", note: "새로", photo: localPhoto, now: created.addingTimeInterval(0.0004))
-        try applier.markSaved(date: "2026-11-18", systemFields: Data([9]), sentUpdatedAt: created)
+        try applier.markSaved(date: "2026-11-18", systemFields: Data([9]), sentUpdatedAt: created, sentBaseSystemFields: nil)
         #expect(!local.needsUpload)
     }
 
@@ -167,7 +167,7 @@ struct SyncChangeApplierTests {
         // 올리는 도중에 또 고침
         try store.updateNote(date: "2026-11-18", note: "그 뒤 수정", now: later)
 
-        try applier.markSaved(date: "2026-11-18", systemFields: Data([9]), sentUpdatedAt: created)
+        try applier.markSaved(date: "2026-11-18", systemFields: Data([9]), sentUpdatedAt: created, sentBaseSystemFields: nil)
 
         #expect(local.systemFields == Data([9]))
         #expect(local.needsUpload)
@@ -178,10 +178,39 @@ struct SyncChangeApplierTests {
         try uploadedStamp()
         try store.delete(date: "2026-11-18")
 
-        try applier.markSaved(date: "2026-11-18", systemFields: Data([9]), sentUpdatedAt: created)
+        try applier.markSaved(date: "2026-11-18", systemFields: Data([9]), sentUpdatedAt: created, sentBaseSystemFields: Data([1]))
 
         let local = try #require(try stamp())
         #expect(local.pendingDeletion && local.needsUpload)
+    }
+
+    @Test func markSavedIgnoresLateResultOfOlderSend() throws {
+        // 보낸 A(기준 nil)가 늦게 도착하기 전에 다른 저장 B가 먼저 반영되어 systemFields가 바뀐 상황
+        let local = try store.create(date: "2026-11-18", note: "B", photo: localPhoto, now: later)
+        local.systemFields = Data([20])  // B의 결과
+        local.needsUpload = false
+        local.photoNeedsUpload = false
+
+        let applied = try applier.markSaved(
+            date: "2026-11-18", systemFields: Data([10]), sentUpdatedAt: created, sentBaseSystemFields: nil
+        )
+
+        #expect(!applied)
+        #expect(local.systemFields == Data([20]))
+        #expect(!local.needsUpload)
+    }
+
+    @Test func markSavedAppliesWhenBaseMatchesUploadedRecord() throws {
+        let local = try uploadedStamp()
+        try store.updateNote(date: "2026-11-18", note: "수정", now: later)
+
+        let applied = try applier.markSaved(
+            date: "2026-11-18", systemFields: Data([9]), sentUpdatedAt: later, sentBaseSystemFields: Data([1])
+        )
+
+        #expect(applied)
+        #expect(local.systemFields == Data([9]))
+        #expect(!local.needsUpload)
     }
 
     @Test func markDeletedRemovesPendingRowAndFiles() throws {

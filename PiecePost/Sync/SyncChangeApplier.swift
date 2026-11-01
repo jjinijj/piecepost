@@ -139,9 +139,23 @@ final class SyncChangeApplier {
     // MARK: 보낸 결과
 
     /// 저장 성공. 보낸 뒤에 로컬이 또 바뀌었으면 `needsUpload`를 유지해 다시 보내게 한다.
-    /// - Parameter sentUpdatedAt: 서버가 돌려준 값이 아니라 **보낼 때 넣은** `updatedAt`
-    func markSaved(date: String, systemFields: Data, sentUpdatedAt: Date) throws {
-        guard let stamp = try stamp(for: date) else { return }
+    ///
+    /// 늦게 도착한 옛 결과가 더 최신 시스템 필드를 덮어쓰지 않도록, 보낼 때 기준으로 삼은
+    /// 시스템 필드가 지금 로컬 값과 같을 때만 반영한다. 다르면 아무것도 바꾸지 않는다.
+    /// - Parameters:
+    ///   - sentUpdatedAt: 서버가 돌려준 값이 아니라 **보낼 때 넣은** `updatedAt`
+    ///   - sentBaseSystemFields: 보낼 때 레코드를 만든 기준 `systemFields`(처음 올렸으면 nil)
+    /// - Returns: 반영했으면 true, 옛 결과라 무시했으면 false
+    @discardableResult
+    func markSaved(
+        date: String,
+        systemFields: Data,
+        sentUpdatedAt: Date,
+        sentBaseSystemFields: Data?
+    ) throws -> Bool {
+        guard let stamp = try stamp(for: date), stamp.systemFields == sentBaseSystemFields else {
+            return false
+        }
         stamp.systemFields = systemFields
         let unchangedSinceSent = abs(stamp.updatedAt.timeIntervalSince(sentUpdatedAt)) < Self.timestampTolerance
         if !stamp.pendingDeletion && unchangedSinceSent {
@@ -149,6 +163,7 @@ final class SyncChangeApplier {
             stamp.photoNeedsUpload = false
         }
         try save()
+        return true
     }
 
     /// 삭제 성공. 삭제 대기 행과 사진 파일을 지운다.
