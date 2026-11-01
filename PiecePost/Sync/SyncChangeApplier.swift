@@ -16,6 +16,9 @@ nonisolated enum ReceiveOutcome: Equatable, Sendable {
 ///
 /// 여기서 바꾼 내용은 `StampStore.onLocalChange`를 부르지 않는다. 받은 변경이 다시 업로드되지 않게 하기 위함.
 final class SyncChangeApplier {
+    /// CloudKit의 Date는 밀리초까지만 저장하므로 시각 비교에 이만큼 여유를 둔다.
+    static let timestampTolerance: TimeInterval = 0.001
+
     private let context: ModelContext
     private let fileStore: StampFileStore
 
@@ -88,6 +91,35 @@ final class SyncChangeApplier {
         guard let stamp = try stamp(for: date) else { return false }
         try removeRowAndFiles(stamp)
         return true
+    }
+
+    // MARK: 보낸 결과
+
+    /// 저장 성공. 보낸 뒤에 로컬이 또 바뀌었으면 `needsUpload`를 유지해 다시 보내게 한다.
+    /// - Parameter sentUpdatedAt: 서버가 돌려준 값이 아니라 **보낼 때 넣은** `updatedAt`
+    func markSaved(date: String, systemFields: Data, sentUpdatedAt: Date) throws {
+        guard let stamp = try stamp(for: date) else { return }
+        stamp.systemFields = systemFields
+        let unchangedSinceSent = abs(stamp.updatedAt.timeIntervalSince(sentUpdatedAt)) < Self.timestampTolerance
+        if !stamp.pendingDeletion && unchangedSinceSent {
+            stamp.needsUpload = false
+            stamp.photoNeedsUpload = false
+        }
+        try save()
+    }
+
+    /// 삭제 성공. 삭제 대기 행과 사진 파일을 지운다.
+    /// 그사이 같은 날짜로 다시 만들었다면 서버에는 없으니 처음 올리는 것처럼 다시 보낸다.
+    func markDeleted(date: String) throws {
+        guard let stamp = try stamp(for: date) else { return }
+        if stamp.pendingDeletion {
+            try removeRowAndFiles(stamp)
+        } else {
+            stamp.systemFields = nil
+            stamp.needsUpload = true
+            stamp.photoNeedsUpload = true
+            try save()
+        }
     }
 
     // MARK: 내부

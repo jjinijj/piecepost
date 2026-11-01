@@ -143,4 +143,69 @@ struct SyncChangeApplierTests {
     @Test func serverDeletionOfUnknownDateDoesNothing() throws {
         #expect(try !applier.applyServerDeletion(date: "2026-11-18"))
     }
+
+    // MARK: 보낸 결과
+
+    @Test func markSavedClearsUploadFlags() throws {
+        let local = try store.create(date: "2026-11-18", note: "새로", photo: localPhoto, now: created)
+
+        try applier.markSaved(date: "2026-11-18", systemFields: Data([9]), sentUpdatedAt: created)
+
+        #expect(local.systemFields == Data([9]))
+        #expect(!local.needsUpload)
+        #expect(!local.photoNeedsUpload)
+    }
+
+    @Test func markSavedToleratesMillisecondPrecision() throws {
+        let local = try store.create(date: "2026-11-18", note: "새로", photo: localPhoto, now: created.addingTimeInterval(0.0004))
+        try applier.markSaved(date: "2026-11-18", systemFields: Data([9]), sentUpdatedAt: created)
+        #expect(!local.needsUpload)
+    }
+
+    @Test func markSavedKeepsFlagsWhenEditedAfterSending() throws {
+        let local = try store.create(date: "2026-11-18", note: "보낸 값", photo: localPhoto, now: created)
+        // 올리는 도중에 또 고침
+        try store.updateNote(date: "2026-11-18", note: "그 뒤 수정", now: later)
+
+        try applier.markSaved(date: "2026-11-18", systemFields: Data([9]), sentUpdatedAt: created)
+
+        #expect(local.systemFields == Data([9]))
+        #expect(local.needsUpload)
+        #expect(local.note == "그 뒤 수정")
+    }
+
+    @Test func markSavedKeepsPendingDeletion() throws {
+        try uploadedStamp()
+        try store.delete(date: "2026-11-18")
+
+        try applier.markSaved(date: "2026-11-18", systemFields: Data([9]), sentUpdatedAt: created)
+
+        let local = try #require(try stamp())
+        #expect(local.pendingDeletion && local.needsUpload)
+    }
+
+    @Test func markDeletedRemovesPendingRowAndFiles() throws {
+        let local = try uploadedStamp()
+        let paths = [local.photoPath, local.thumbnailPath]
+        try store.delete(date: "2026-11-18")
+        #expect(paths.allSatisfy(fileExists))  // 삭제 대기 중에는 파일 유지
+
+        try applier.markDeleted(date: "2026-11-18")
+
+        #expect(try stamp() == nil)
+        #expect(!paths.contains(where: fileExists))
+    }
+
+    @Test func markDeletedAfterRecreateUploadsAsNew() throws {
+        try uploadedStamp()
+        try store.delete(date: "2026-11-18")
+        let recreated = try store.create(date: "2026-11-18", note: "다시", photo: localPhoto, now: later)
+        recreated.needsUpload = false
+
+        try applier.markDeleted(date: "2026-11-18")
+
+        #expect(recreated.systemFields == nil)
+        #expect(recreated.needsUpload && recreated.photoNeedsUpload)
+        #expect(recreated.note == "다시")
+    }
 }
