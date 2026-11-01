@@ -21,6 +21,9 @@ final class StampSyncEngine {
     }
     private var sentInfo: [CKRecord.ID: SentInfo] = [:]
 
+    /// 보낼 값을 읽다 오류가 나서 이번 보내기에서 뺀 레코드. 보내기가 끝나면 다시 예약한다.
+    private var deferredSaves: Set<CKRecord.ID> = []
+
     init(applier: SyncChangeApplier, stateStore: SyncStateStore = SyncStateStore(), monitor: SyncMonitor) {
         self.applier = applier
         self.stateStore = stateStore
@@ -108,10 +111,18 @@ final class StampSyncEngine {
     // MARK: 보내기
 
     fileprivate func recordToSave(_ recordID: CKRecord.ID, engine: CKSyncEngine) -> CKRecord? {
-        guard
-            let date = StampRecordMapper.date(from: recordID),
-            let values = try? applier.uploadValues(for: date)
-        else {
+        let values: StampUploadValues?
+        do {
+            values = try StampRecordMapper.date(from: recordID).flatMap(applier.uploadValues(for:))
+        } catch {
+            // 일시적인 읽기 오류일 수 있으니 예약을 버리지 않는다. 이번 보내기에서만 빼 두었다가
+            // 보내기가 끝나면 다시 예약한다(같은 보내기 안에서 곧바로 반복되지 않게).
+            log.add("보낼 값 읽기 실패, 다음 보내기에 다시: \(Self.describe(error))")
+            engine.state.remove(pendingRecordZoneChanges: [.saveRecord(recordID)])
+            deferredSaves.insert(recordID)
+            return nil
+        }
+        guard let values else {
             // 행이 없거나 삭제 대기면 보낼 것이 없다.
             engine.state.remove(pendingRecordZoneChanges: [.saveRecord(recordID)])
             return nil
@@ -166,6 +177,11 @@ final class StampSyncEngine {
             monitor.status = .syncing
         case .didSendChanges:
             if monitor.status == .syncing { monitor.status = .idle }
+            if !deferredSaves.isEmpty {
+                log.add("읽기 실패로 미룬 저장 \(deferredSaves.count)건 다시 예약")
+                engine.state.add(pendingRecordZoneChanges: deferredSaves.map { .saveRecord($0) })
+                deferredSaves.removeAll()
+            }
 
         case .willFetchRecordZoneChanges, .didFetchRecordZoneChanges:
             break
