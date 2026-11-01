@@ -24,9 +24,8 @@
 
 ## 남은 작업 (동기화 시험, 순서대로)
 PR이 머지될 때마다 이 목록을 갱신한다.
-- **PR 4b `feature/sync-engine-core`**: CKSyncEngine 연결, 엔진 상태 저장·복원, 존 `Stamps` 생성, 보내기·받기 연결, 원격 알림 등록, 시험 화면의 동기화 상태·최근 로그·"지금 가져오기", 진단 로그
-- **PR 5 `feature/sync-conflicts`**: `serverRecordChanged` 처리(`updatedAt`이 늦은 쪽), 로컬에 보낼 변경이 있을 때 받은 변경 처리(지금은 건드리지 않는 임시 처리), 삭제와 수정 충돌
-- **PR 6 `feature/sync-account-status`**: iCloud 꺼짐·로그아웃·계정 변경, 용량 부족, 상태 표시
+- **충돌 처리 `feature/sync-conflicts`**: `serverRecordChanged` 처리(`updatedAt`이 늦은 쪽), 로컬에 보낼 변경이 있을 때 받은 변경 처리(지금은 건드리지 않는 임시 처리), 삭제와 수정 충돌. 지금 엔진은 `serverRecordChanged`를 로그만 남기는 임시 처리
+- **계정 상태 `feature/sync-account-status`**: iCloud 꺼짐·로그아웃·계정 변경, 용량 부족, 상태 표시(지금은 로그와 상태 문구만 바꾸는 임시 처리)
 - 미뤄 둔 것: 우표 사진 바꾸기(실제 화면 작업 때), 주인 없는 사진 파일 정리, 실제 화면 S01~S04
 
 ## 이미 정한 결정 (지적하지 않음)

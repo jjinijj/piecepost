@@ -1,10 +1,13 @@
 import SwiftUI
 import SwiftData
 
-/// 동기화 시험 화면. 우표 목록·만들기·기록 수정·삭제.
+/// 동기화 시험 화면. 우표 목록·만들기·기록 수정·삭제, 동기화 상태와 최근 로그.
 /// 쓰기는 `StampStore`로만 하고, 목록은 같은 로컬 저장소를 `@Query`로 읽는다. CloudKit은 부르지 않는다.
 struct SyncSpikeView: View {
     let store: StampStore
+    let monitor: SyncMonitor
+    /// 시뮬레이터처럼 푸시를 잘 받지 못하는 환경에서 수동으로 가져온다.
+    let fetchNow: () async -> Void
 
     @Query(
         filter: #Predicate<Stamp> { !$0.pendingDeletion },
@@ -16,13 +19,29 @@ struct SyncSpikeView: View {
     @State private var isCreating = false
     @State private var editingStamp: Stamp?
     @State private var errorMessage: String?
+    @State private var isFetching = false
 
     var body: some View {
         NavigationStack {
             List {
                 Section {
-                    // PR 5(동기화 엔진)에서 실제 상태로 바꾼다.
-                    LabeledContent("동기화", value: "연결 전")
+                    LabeledContent("동기화", value: monitor.status.label)
+                    Button {
+                        Task {
+                            isFetching = true
+                            await fetchNow()
+                            isFetching = false
+                        }
+                    } label: {
+                        HStack {
+                            Text("지금 가져오기")
+                            if isFetching {
+                                Spacer()
+                                ProgressView()
+                            }
+                        }
+                    }
+                    .disabled(isFetching || monitor.status == .notStarted)
                 }
 
                 Section("우표 \(stamps.count)장") {
@@ -35,11 +54,27 @@ struct SyncSpikeView: View {
                         .foregroundStyle(.primary)
                     }
                     .onDelete(perform: delete)
+                    if stamps.isEmpty {
+                        Text("우표 없음. + 버튼으로 만들어 보세요.")
+                            .foregroundStyle(.secondary)
+                    }
                 }
-            }
-            .overlay {
-                if stamps.isEmpty {
-                    ContentUnavailableView("우표 없음", systemImage: "envelope", description: Text("+ 버튼으로 만들어 보세요."))
+
+                Section("최근 로그") {
+                    if monitor.log.entries.isEmpty {
+                        Text("로그 없음")
+                            .foregroundStyle(.secondary)
+                    }
+                    ForEach(monitor.log.entries) { entry in
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(entry.time, format: .dateTime.hour().minute().second())
+                                .font(.caption2)
+                                .monospacedDigit()
+                                .foregroundStyle(.secondary)
+                            Text(entry.message)
+                                .font(.caption)
+                        }
+                    }
                 }
             }
             .navigationTitle("동기화 시험")
@@ -113,6 +148,6 @@ private struct StampRow: View {
         for: Stamp.self,
         configurations: ModelConfiguration(isStoredInMemoryOnly: true, cloudKitDatabase: .none)
     )
-    SyncSpikeView(store: StampStore(context: container.mainContext))
+    SyncSpikeView(store: StampStore(context: container.mainContext), monitor: SyncMonitor()) {}
         .modelContainer(container)
 }
