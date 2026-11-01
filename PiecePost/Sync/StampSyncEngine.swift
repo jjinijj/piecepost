@@ -12,7 +12,10 @@ final class StampSyncEngine {
     private let applier: SyncChangeApplier
     private let stateStore: SyncStateStore
     private let monitor: SyncMonitor
+    private let retryList: ReceiveRetryList
     private var engine: CKSyncEngine?
+    private var database: CKDatabase?
+    private var isRetryingReceives = false
 
     /// 보낸 레코드의 결과를 받을 때 필요한 값. 결과 콜백에는 "보낼 때" 값이 없으므로 여기 기억해 둔다.
     private struct SentInfo {
@@ -24,9 +27,15 @@ final class StampSyncEngine {
     /// 보낼 값을 읽다 오류가 나서 이번 보내기에서 뺀 레코드. 보내기가 끝나면 다시 예약한다.
     private var deferredSaves: Set<CKRecord.ID> = []
 
-    init(applier: SyncChangeApplier, stateStore: SyncStateStore = SyncStateStore(), monitor: SyncMonitor) {
+    init(
+        applier: SyncChangeApplier,
+        stateStore: SyncStateStore = SyncStateStore(),
+        retryList: ReceiveRetryList = ReceiveRetryList(),
+        monitor: SyncMonitor
+    ) {
         self.applier = applier
         self.stateStore = stateStore
+        self.retryList = retryList
         self.monitor = monitor
     }
 
@@ -55,6 +64,7 @@ final class StampSyncEngine {
         )
         let engine = CKSyncEngine(configuration)
         self.engine = engine
+        self.database = database
 
         if savedState == nil {
             engine.state.add(pendingDatabaseChanges: [.saveZone(CKRecordZone(zoneID: StampRecordMapper.zoneID))])
@@ -69,6 +79,7 @@ final class StampSyncEngine {
         } catch {
             log.add("보낼 변경 읽기 실패: \(Self.describe(error))")
         }
+        Task { await retryFailedReceives() }
     }
 
     /// 시뮬레이터처럼 푸시를 잘 받지 못하는 환경을 위한 수동 가져오기.
@@ -173,6 +184,7 @@ final class StampSyncEngine {
         case .didFetchChanges:
             if monitor.status == .syncing { monitor.status = .idle }
             log.add("가져오기 끝")
+            Task { await retryFailedReceives() }
         case .willSendChanges:
             monitor.status = .syncing
         case .didSendChanges:
@@ -213,7 +225,8 @@ final class StampSyncEngine {
     // MARK: 받은 변경
 
     private func applyFetched(_ changes: CKSyncEngine.Event.FetchedRecordZoneChanges) {
-        var inserted = 0, updated = 0, skippedPending = 0, skippedDeletion = 0, deleted = 0, failed = 0
+        var inserted = 0, updated = 0, skippedPending = 0, skippedDeletion = 0, deleted = 0, failed = 0, retryLater = 0
+        var applied: [String] = []
 
         for modification in changes.modifications {
             let record = modification.record
@@ -230,9 +243,15 @@ final class StampSyncEngine {
                 case .skippedLocalPending: skippedPending += 1
                 case .skippedPendingDeletion: skippedDeletion += 1
                 }
-            } catch {
+                applied.append(record.recordID.recordName)
+            } catch let error as StampRecordError {
+                // 형식이 잘못된 레코드는 다시 받아도 같으므로 건너뛴다(합의된 동작).
                 failed += 1
                 log.add("받은 레코드 건너뜀: \(Self.describe(error))")
+            } catch {
+                // 저장 공간·DB 오류처럼 다시 하면 될 수 있는 실패. 엔진은 다시 보내 주지 않으므로 따로 다시 받는다.
+                retryLater += 1
+                markForRetry(record.recordID, error: error)
             }
         }
 
@@ -240,16 +259,85 @@ final class StampSyncEngine {
             guard let date = StampRecordMapper.date(from: deletion.recordID) else { continue }
             do {
                 if try applier.applyServerDeletion(date: date) { deleted += 1 }
+                applied.append(deletion.recordID.recordName)
             } catch {
-                failed += 1
-                log.add("받은 삭제 반영 실패: \(Self.describe(error))")
+                // 다시 받을 때 서버에 없다고 나오면 그때 삭제를 반영한다.
+                retryLater += 1
+                markForRetry(deletion.recordID, error: error)
             }
         }
 
+        // 다시 받기 목록에 있던 것이 정상으로 반영됐으면 목록에서 뺀다.
+        try? retryList.remove(applied)
         log.add(
             "받음: 추가 \(inserted), 갱신 \(updated), 삭제 \(deleted), "
-                + "건너뜀(로컬 대기 \(skippedPending), 삭제 대기 \(skippedDeletion)), 실패 \(failed)"
+                + "건너뜀(로컬 대기 \(skippedPending), 삭제 대기 \(skippedDeletion)), "
+                + "형식 오류 \(failed), 다시 받기 \(retryLater)"
         )
+    }
+
+    private func markForRetry(_ recordID: CKRecord.ID, error: any Error) {
+        log.add("받은 변경 반영 실패, 다시 받기 목록에 추가: \(Self.describe(error))")
+        do {
+            try retryList.add(recordID.recordName)
+        } catch {
+            log.add("다시 받기 목록 저장 실패: \(Self.describe(error))")
+        }
+    }
+
+    /// 반영에 실패했던 레코드만 iCloud에서 직접 다시 받아 반영한다. 앱 시작과 가져오기 끝에 부른다.
+    func retryFailedReceives() async {
+        guard !isRetryingReceives, let database else { return }
+        let names = retryList.names()
+        guard !names.isEmpty else { return }
+        isRetryingReceives = true
+        defer { isRetryingReceives = false }
+
+        log.add("반영 실패 \(names.count)건 다시 받기")
+        let ids = names.map { CKRecord.ID(recordName: $0, zoneID: StampRecordMapper.zoneID) }
+        let results: [CKRecord.ID: Result<CKRecord, any Error>]
+        do {
+            results = try await database.records(for: ids)
+        } catch {
+            log.add("다시 받기 실패, 다음에 다시: \(Self.describe(error))")
+            return
+        }
+
+        var finished: [String] = []
+        var recovered = 0, deletedOnServer = 0, invalid = 0, remaining = 0
+        for (id, result) in results {
+            switch result {
+            case .success(let record):
+                do {
+                    // 사진 임시 파일이 사라지기 전에 바로 반영(복사)한다.
+                    try applier.applyReceived(try StampRecordMapper.receivedStamp(from: record))
+                    recovered += 1
+                    finished.append(id.recordName)
+                } catch is StampRecordError {
+                    invalid += 1
+                    finished.append(id.recordName)
+                } catch {
+                    remaining += 1
+                }
+            case .failure(let error):
+                if (error as? CKError)?.code == .unknownItem {
+                    // 서버에 없음 → 삭제 우선
+                    if let date = StampRecordMapper.date(from: id) {
+                        _ = try? applier.applyServerDeletion(date: date)
+                    }
+                    deletedOnServer += 1
+                    finished.append(id.recordName)
+                } else {
+                    remaining += 1
+                }
+            }
+        }
+        do {
+            try retryList.remove(finished)
+        } catch {
+            log.add("다시 받기 목록 저장 실패: \(Self.describe(error))")
+        }
+        log.add("다시 받기: 반영 \(recovered), 서버에 없음 \(deletedOnServer), 형식 오류 \(invalid), 남음 \(remaining)")
     }
 
     // MARK: 보낸 결과
