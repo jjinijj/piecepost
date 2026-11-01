@@ -11,10 +11,15 @@ nonisolated enum PendingStampChange: Hashable, Sendable {
 nonisolated enum ReceiveOutcome: Equatable, Sendable {
     case inserted
     case updated
-    /// 로컬에 아직 보내지 않은 변경이 있어 건드리지 않음. 충돌 처리는 다음 PR에서 정한다.
-    case skippedLocalPending
+    /// 로컬에 보낼 변경이 있었지만 받은 쪽 `updatedAt`이 늦어 받은 내용으로 바꿈. 로컬 변경은 버린다.
+    case conflictServerWon
+    /// 로컬에 보낼 변경이 있고 로컬이 이겨 유지함. 받은 시스템 필드만 저장하고 계속 보낸다.
+    /// - resendsPhoto: 서버 사진이 로컬과 달라 다음 보내기에 사진도 넣는지
+    case conflictLocalWon(resendsPhoto: Bool)
     /// 로컬에서 삭제 대기 중이라 건드리지 않음(삭제 우선).
     case skippedPendingDeletion
+    /// 늦게 도착한 옛 보내기 결과라 무시함. 로컬이 이미 더 새 서버 레코드를 반영했거나 보낸 뒤 바뀌었다.
+    case skippedStaleResult
 }
 
 /// CloudKit에서 받은 변경과 보낸 결과를 로컬 저장소에 반영하는 규칙.
@@ -54,9 +59,10 @@ final class SyncChangeApplier {
         return .save(date: date)
     }
 
-    /// 업로드할 값. 행이 없거나 삭제 대기면 nil(보낼 목록에서 뺀다).
+    /// 업로드할 값. 행이 없거나, 삭제 대기거나, 보낼 변경이 없으면 nil(보낼 목록에서 뺀다).
+    /// 충돌로 서버 내용을 받아 보낼 변경이 없어진 우표가 엔진에 남아 있어도 다시 보내지 않게 한다.
     func uploadValues(for date: String) throws -> StampUploadValues? {
-        guard let stamp = try stamp(for: date), !stamp.pendingDeletion else { return nil }
+        guard let stamp = try stamp(for: date), !stamp.pendingDeletion, stamp.needsUpload else { return nil }
         return StampUploadValues(
             date: stamp.date,
             note: stamp.note,
@@ -73,57 +79,54 @@ final class SyncChangeApplier {
     // MARK: 받은 변경
 
     /// 받은 우표를 반영한다. 사진 임시 파일은 이 안에서 앱 폴더로 복사한다.
+    ///
+    /// 로컬에 보낼 변경이 있으면 `updatedAt`이 늦은 쪽을 남긴다. 받은 쪽이 늦으면 받은 내용으로 바꾸고
+    /// 로컬 변경은 버린다. 로컬이 늦거나 같으면 로컬을 유지하고 받은 시스템 필드만 저장해,
+    /// 다음 보내기가 최신 서버 레코드를 기준으로 하게 한다(`serverRecordChanged` 반복 방지).
     @discardableResult
     func applyReceived(_ received: ReceivedStamp) throws -> ReceiveOutcome {
-        let existing = try stamp(for: received.date)
-        if let existing {
-            if existing.pendingDeletion { return .skippedPendingDeletion }
-            if existing.needsUpload { return .skippedLocalPending }
+        guard let existing = try stamp(for: received.date) else {
+            try insert(received)
+            return .inserted
         }
+        if existing.pendingDeletion { return .skippedPendingDeletion }
+        guard existing.needsUpload else {
+            try replace(existing, with: received)
+            return .updated
+        }
+        if Self.isLater(received.updatedAt, than: existing.updatedAt) {
+            try replace(existing, with: received)
+            return .conflictServerWon
+        }
+        return .conflictLocalWon(resendsPhoto: try keepLocal(existing, over: received))
+    }
 
-        let paths = try fileStore.importFiles(
-            photoFrom: received.photoFileURL,
-            thumbnailFrom: received.thumbnailFileURL
-        )
-        let outcome: ReceiveOutcome
-        let replacedPaths: [String]
-        if let existing {
-            replacedPaths = [existing.photoPath, existing.thumbnailPath]
-            existing.note = received.note
-            existing.photoPath = paths.photoPath
-            existing.thumbnailPath = paths.thumbnailPath
-            existing.createdAt = received.createdAt
-            existing.updatedAt = received.updatedAt
-            existing.schemaVersion = received.schemaVersion
-            existing.systemFields = received.systemFields
-            existing.needsUpload = false
-            existing.photoNeedsUpload = false
-            outcome = .updated
-        } else {
-            replacedPaths = []
-            context.insert(Stamp(
-                date: received.date,
-                note: received.note,
-                photoPath: paths.photoPath,
-                thumbnailPath: paths.thumbnailPath,
-                createdAt: received.createdAt,
-                updatedAt: received.updatedAt,
-                schemaVersion: received.schemaVersion,
-                systemFields: received.systemFields,
-                needsUpload: false,
-                photoNeedsUpload: false
-            ))
-            outcome = .inserted
+    /// 보내기가 `serverRecordChanged`로 실패했을 때 서버 레코드와 비교해 남길 쪽을 정한다.
+    ///
+    /// 로컬 `updatedAt`이 늦으면 로컬을 유지하고 서버 레코드의 시스템 필드를 저장한다(호출하는 쪽이 다시 보낸다).
+    /// 이르거나 같으면 서버 레코드를 반영하고 로컬의 보낼 변경을 없앤다.
+    ///
+    /// 늦게 도착한 옛 실패 결과가 그사이 반영한 더 새 서버 레코드를 되돌리지 않도록, `markSaved`처럼
+    /// 보낼 때 기준으로 삼은 시스템 필드가 지금 로컬 값과 같을 때만 판정한다. 보낼 변경이 없는 우표는
+    /// 서버 쪽 `updatedAt`이 더 늦을 때만 반영한다.
+    /// - Parameter sentBaseSystemFields: 실패한 레코드를 만들 때 기준으로 삼은 `systemFields`(처음 올렸으면 nil)
+    /// - Returns: `.conflictLocalWon`, `.conflictServerWon`, 옛 결과면 `.skippedStaleResult`,
+    ///   로컬에 행이 없거나 삭제 대기면 `.skippedPendingDeletion`(삭제 예약이 따로 있으므로 삭제 우선)
+    @discardableResult
+    func resolveSaveConflict(server: ReceivedStamp, sentBaseSystemFields: Data?) throws -> ReceiveOutcome {
+        guard let existing = try stamp(for: server.date), !existing.pendingDeletion else {
+            return .skippedPendingDeletion
         }
-
-        do {
-            try save()
-        } catch {
-            fileStore.remove(paths.all)
-            throw error
+        guard existing.systemFields == sentBaseSystemFields else { return .skippedStaleResult }
+        if existing.needsUpload {
+            if Self.isLater(existing.updatedAt, than: server.updatedAt) {
+                return .conflictLocalWon(resendsPhoto: try keepLocal(existing, over: server))
+            }
+        } else if !Self.isLater(server.updatedAt, than: existing.updatedAt) {
+            return .skippedStaleResult
         }
-        fileStore.remove(replacedPaths)
-        return outcome
+        try replace(existing, with: server)
+        return .conflictServerWon
     }
 
     /// 서버에서 지워진 우표. 로컬에 보낼 변경이 있어도 지운다(삭제 우선).
@@ -181,6 +184,84 @@ final class SyncChangeApplier {
     }
 
     // MARK: 내부
+
+    /// `a`가 `b`보다 늦은지. CloudKit이 밀리초까지만 저장하므로 그보다 작은 차이는 같은 시각으로 본다.
+    private static func isLater(_ a: Date, than b: Date) -> Bool {
+        a.timeIntervalSince(b) >= timestampTolerance
+    }
+
+    private func insert(_ received: ReceivedStamp) throws {
+        let paths = try fileStore.importFiles(
+            photoFrom: received.photoFileURL,
+            thumbnailFrom: received.thumbnailFileURL
+        )
+        context.insert(Stamp(
+            date: received.date,
+            note: received.note,
+            photoPath: paths.photoPath,
+            thumbnailPath: paths.thumbnailPath,
+            createdAt: received.createdAt,
+            updatedAt: received.updatedAt,
+            schemaVersion: received.schemaVersion,
+            systemFields: received.systemFields,
+            needsUpload: false,
+            photoNeedsUpload: false
+        ))
+        do {
+            try save()
+        } catch {
+            fileStore.remove(paths.all)
+            throw error
+        }
+    }
+
+    /// 받은 내용으로 바꾸고 보낼 변경을 없앤다. 밀린 로컬 사진 파일은 저장이 끝나면 지운다.
+    private func replace(_ stamp: Stamp, with received: ReceivedStamp) throws {
+        let paths = try fileStore.importFiles(
+            photoFrom: received.photoFileURL,
+            thumbnailFrom: received.thumbnailFileURL
+        )
+        let replacedPaths = [stamp.photoPath, stamp.thumbnailPath]
+        stamp.note = received.note
+        stamp.photoPath = paths.photoPath
+        stamp.thumbnailPath = paths.thumbnailPath
+        stamp.createdAt = received.createdAt
+        stamp.updatedAt = received.updatedAt
+        stamp.schemaVersion = received.schemaVersion
+        stamp.systemFields = received.systemFields
+        stamp.needsUpload = false
+        stamp.photoNeedsUpload = false
+        do {
+            try save()
+        } catch {
+            fileStore.remove(paths.all)
+            throw error
+        }
+        fileStore.remove(replacedPaths)
+    }
+
+    /// 로컬 내용을 유지하고 서버 레코드의 시스템 필드만 저장한다. 받은 사진은 복사하지 않는다.
+    /// 서버 사진이 로컬과 다르면 사진도 다시 보내게 해서, 서버에 밀린 쪽 사진과 이긴 쪽 기록이
+    /// 섞여 남지 않게 한다. 같으면 기록만 보낸다(불변 규칙 5).
+    /// - Returns: 사진도 다시 보내게 됐으면 true
+    private func keepLocal(_ stamp: Stamp, over received: ReceivedStamp) throws -> Bool {
+        stamp.systemFields = received.systemFields
+        var resendsPhoto = false
+        if !stamp.photoNeedsUpload && !hasSamePhoto(stamp, as: received) {
+            stamp.photoNeedsUpload = true
+            resendsPhoto = true
+        }
+        try save()
+        return resendsPhoto
+    }
+
+    /// 파일 내용으로 비교한다. 어느 쪽이든 읽을 수 없으면 다르다고 본다(사진을 다시 보내는 쪽이 안전).
+    private func hasSamePhoto(_ stamp: Stamp, as received: ReceivedStamp) -> Bool {
+        FileManager.default.contentsEqual(
+            atPath: fileStore.url(for: stamp.photoPath).path(percentEncoded: false),
+            andPath: received.photoFileURL.path(percentEncoded: false)
+        )
+    }
 
     private func stamp(for date: String) throws -> Stamp? {
         var descriptor = FetchDescriptor<Stamp>(predicate: #Predicate { $0.date == date })
