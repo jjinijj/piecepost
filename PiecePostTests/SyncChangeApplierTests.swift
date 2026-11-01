@@ -1,3 +1,4 @@
+import CloudKit
 import Foundation
 import SwiftData
 import Testing
@@ -217,6 +218,119 @@ struct SyncChangeApplierTests {
 
     @Test func serverDeletionOfUnknownDateDoesNothing() throws {
         #expect(try !applier.applyServerDeletion(date: "2026-11-18"))
+    }
+
+    // MARK: 보낼 때 충돌 (serverRecordChanged)
+
+    /// 실제 CKRecord에서 뽑은 시스템 필드. 보낼 레코드를 이 값으로 복원할 수 있다.
+    private func realSystemFields(date: String = "2026-11-18") -> Data {
+        let record = CKRecord(recordType: StampRecordMapper.recordType, recordID: StampRecordMapper.recordID(for: date))
+        return StampRecordMapper.encodeSystemFields(of: record)
+    }
+
+    @Test func saveConflictLocalLaterKeepsLocalAndResendsOnServerBase() throws {
+        let local = try uploadedStamp(photo: serverPhoto)
+        try store.updateNote(date: "2026-11-18", note: "로컬 수정", now: evenLater)
+        let serverFields = realSystemFields()
+
+        let outcome = try applier.resolveSaveConflict(
+            server: try received(note: "서버", updatedAt: later, photo: serverPhoto.photo, systemFields: serverFields)
+        )
+
+        #expect(outcome == .conflictLocalWon(resendsPhoto: false))
+        #expect(local.note == "로컬 수정" && local.updatedAt == evenLater)
+        #expect(local.needsUpload && !local.photoNeedsUpload)
+        #expect(local.systemFields == serverFields)
+        #expect(try photoFileCount() == 1)
+
+        // 다시 보낼 레코드는 서버 시스템 필드를 기준으로 하고, 같은 사진이면 기록만 담는다(불변 규칙 5)
+        let values = try #require(try applier.uploadValues(for: "2026-11-18"))
+        #expect(values.systemFields == serverFields)
+        let record = StampRecordMapper.record(from: values)
+        #expect(record[StampRecordMapper.Field.note] as? String == "로컬 수정")
+        #expect(record[StampRecordMapper.Field.photo] == nil)
+
+        // 다시 보내기 성공 → 보낼 변경이 없어진다(반복 없음)
+        #expect(try applier.markSaved(
+            date: "2026-11-18", systemFields: Data([77]), sentUpdatedAt: values.updatedAt, sentBaseSystemFields: serverFields
+        ))
+        #expect(!local.needsUpload && local.systemFields == Data([77]))
+        #expect(try applier.uploadValues(for: "2026-11-18") == nil)
+    }
+
+    @Test func saveConflictLocalWinnerSendsPhotoWhenServerPhotoDiffers() throws {
+        // 서버에는 다른 사진이 있고 로컬은 기록만 고친 상태에서 로컬이 이김
+        let local = try uploadedStamp()
+        try store.updateNote(date: "2026-11-18", note: "로컬 수정", now: evenLater)
+
+        let outcome = try applier.resolveSaveConflict(
+            server: try received(updatedAt: later, photo: Data([9, 9]), systemFields: realSystemFields())
+        )
+
+        #expect(outcome == .conflictLocalWon(resendsPhoto: true))
+        #expect(local.photoNeedsUpload)
+        let record = StampRecordMapper.record(from: try #require(try applier.uploadValues(for: "2026-11-18")))
+        let photo = try #require(record[StampRecordMapper.Field.photo] as? CKAsset)
+        #expect(photo.fileURL == fileStore.url(for: local.photoPath))
+        #expect(record[StampRecordMapper.Field.thumbnail] is CKAsset)
+    }
+
+    @Test func saveConflictNewLocalPhotoIsSentWhenLocalWins() throws {
+        // 두 기기가 같은 날짜를 따로 만든 경우(S5): 로컬은 처음부터 사진을 보낼 예정
+        let local = try store.create(date: "2026-11-18", note: "A", photo: localPhoto, now: evenLater)
+
+        let outcome = try applier.resolveSaveConflict(
+            server: try received(note: "B", updatedAt: later, systemFields: realSystemFields())
+        )
+
+        #expect(outcome == .conflictLocalWon(resendsPhoto: false))
+        #expect(local.photoNeedsUpload && local.needsUpload)
+        #expect(local.note == "A")
+        #expect(try photoFileCount() == 1)
+    }
+
+    @Test func saveConflictServerLaterReplacesLocal() throws {
+        let local = try store.create(date: "2026-11-18", note: "A", photo: localPhoto, now: later)
+        let oldPaths = [local.photoPath, local.thumbnailPath]
+
+        let outcome = try applier.resolveSaveConflict(server: try received(note: "B", updatedAt: evenLater))
+
+        #expect(outcome == .conflictServerWon)
+        #expect(local.note == "B" && local.updatedAt == evenLater)
+        #expect(local.systemFields == Data([42]))
+        #expect(!local.needsUpload && !local.photoNeedsUpload)
+        #expect(try fileData(local.photoPath) == Data([7, 7, 7]))
+        #expect(try fileData(local.thumbnailPath) == Data([8]))
+        // 밀린 로컬 사진 파일은 지우고 이긴 쪽 파일만 남는다
+        #expect(!oldPaths.contains(where: fileExists))
+        #expect(try photoFileCount() == 1)
+        #expect(try applier.pendingChanges().isEmpty)
+        #expect(try applier.uploadValues(for: "2026-11-18") == nil)
+    }
+
+    @Test func saveConflictWithSameTimestampTakesServer() throws {
+        let local = try store.create(date: "2026-11-18", note: "A", photo: localPhoto, now: later.addingTimeInterval(0.0004))
+
+        let outcome = try applier.resolveSaveConflict(server: try received(note: "B", updatedAt: later))
+
+        #expect(outcome == .conflictServerWon)
+        #expect(local.note == "B" && !local.needsUpload)
+    }
+
+    @Test func saveConflictKeepsPendingDeletion() throws {
+        try uploadedStamp()
+        try store.delete(date: "2026-11-18")
+
+        #expect(try applier.resolveSaveConflict(server: try received(updatedAt: evenLater)) == .skippedPendingDeletion)
+
+        let local = try #require(try stamp())
+        #expect(local.pendingDeletion && local.needsUpload)
+        #expect(local.systemFields == Data([1]))
+    }
+
+    @Test func saveConflictForMissingRowDoesNothing() throws {
+        #expect(try applier.resolveSaveConflict(server: try received()) == .skippedPendingDeletion)
+        #expect(try stamp() == nil)
     }
 
     // MARK: 보낸 결과

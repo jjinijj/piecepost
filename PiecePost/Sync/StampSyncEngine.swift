@@ -427,8 +427,7 @@ final class StampSyncEngine {
             log.add("저장 실패(재시도 대기): \(Self.describe(error))")
 
         case .serverRecordChanged:
-            // 충돌 처리 PR에서 처리한다. needsUpload가 남아 있어 다음 실행 때 다시 시도된다.
-            log.add("저장 실패 serverRecordChanged: 충돌 처리 미구현, 로그만")
+            resolveSaveConflict(id: id, error: error, engine: engine)
 
         case .quotaExceeded:
             monitor.status = .quotaExceeded
@@ -442,6 +441,42 @@ final class StampSyncEngine {
             // 판단 분기에 없는 코드. 처리 방식은 정하지 않고 보고한다.
             monitor.status = .error(code: error.code.rawValue)
             log.add("저장 실패(처리 방식 미정): \(Self.describe(error))")
+        }
+    }
+
+    /// `updatedAt`이 늦은 쪽을 남긴다. 로그에는 상태만 남긴다(날짜·내용·레코드 이름 금지).
+    private func resolveSaveConflict(id: CKRecord.ID, error: CKError, engine: CKSyncEngine) {
+        guard let serverRecord = error.serverRecord else {
+            // 비교할 서버 레코드가 없으면 직접 다시 받아 받기 충돌 규칙으로 처리한다.
+            log.add("충돌 serverRecordChanged: 서버 레코드 없음, 다시 받기")
+            markForRetry(id, error: error)
+            Task { await retryFailedReceives() }
+            return
+        }
+        let server: ReceivedStamp
+        do {
+            server = try StampRecordMapper.receivedStamp(from: serverRecord)
+        } catch {
+            // 형식이 잘못된 서버 레코드는 받기와 같이 건너뛴다. needsUpload는 남아 다음 실행 때 다시 시도된다.
+            log.add("충돌 serverRecordChanged: 서버 레코드 형식 오류, 건너뜀: \(Self.describe(error))")
+            return
+        }
+        do {
+            switch try applier.resolveSaveConflict(server: server) {
+            case .conflictLocalWon(let resendsPhoto):
+                log.add(resendsPhoto
+                    ? "충돌 serverRecordChanged: 로컬 채택, 사진도 다시 보냄"
+                    : "충돌 serverRecordChanged: 로컬 채택")
+                engine.state.add(pendingRecordZoneChanges: [.saveRecord(id)])
+            case .conflictServerWon, .updated, .inserted:
+                log.add("충돌 serverRecordChanged: 서버 채택")
+                engine.state.remove(pendingRecordZoneChanges: [.saveRecord(id)])
+            case .skippedPendingDeletion:
+                log.add("충돌 serverRecordChanged: 로컬 삭제 대기, 삭제 우선")
+            }
+        } catch {
+            // 사진 복사·저장 실패처럼 다시 하면 될 수 있는 실패. 다시 받아 받기 충돌 규칙으로 처리한다.
+            markForRetry(id, error: error)
         }
     }
 

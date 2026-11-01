@@ -99,6 +99,24 @@ final class SyncChangeApplier {
         return .conflictLocalWon(resendsPhoto: try keepLocal(existing, over: received))
     }
 
+    /// 보내기가 `serverRecordChanged`로 실패했을 때 서버 레코드와 비교해 남길 쪽을 정한다.
+    ///
+    /// 로컬 `updatedAt`이 늦으면 로컬을 유지하고 서버 레코드의 시스템 필드를 저장한다(호출하는 쪽이 다시 보낸다).
+    /// 이르거나 같으면 서버 레코드를 반영하고 로컬의 보낼 변경을 없앤다.
+    /// - Returns: `.conflictLocalWon`, `.conflictServerWon`, 또는 로컬에 행이 없거나 삭제 대기면
+    ///   `.skippedPendingDeletion`(삭제 예약이 따로 있으므로 삭제 우선)
+    @discardableResult
+    func resolveSaveConflict(server: ReceivedStamp) throws -> ReceiveOutcome {
+        guard let existing = try stamp(for: server.date), !existing.pendingDeletion else {
+            return .skippedPendingDeletion
+        }
+        if existing.needsUpload && Self.isLater(existing.updatedAt, than: server.updatedAt) {
+            return .conflictLocalWon(resendsPhoto: try keepLocal(existing, over: server))
+        }
+        try replace(existing, with: server)
+        return .conflictServerWon
+    }
+
     /// 서버에서 지워진 우표. 로컬에 보낼 변경이 있어도 지운다(삭제 우선).
     /// `unknownItem`(올렸는데 서버에 이미 없음)도 같은 처리를 한다.
     /// - Returns: 로컬에서 지웠으면 true
