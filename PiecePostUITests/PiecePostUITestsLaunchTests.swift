@@ -20,6 +20,8 @@ final class PiecePostUITestsLaunchTests: XCTestCase {
     @MainActor
     func testLaunch() throws {
         let app = XCUIApplication()
+        // UI 테스트 중에는 CloudKit 동기화를 켜지 않는다.
+        app.launchArguments = ["-PiecePostDisableSync"]
         app.launch()
 
         // Insert steps here to perform after app launch but before taking a screenshot,

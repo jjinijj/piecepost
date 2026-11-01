@@ -26,6 +26,8 @@ final class PiecePostUITests: XCTestCase {
     func testExample() throws {
         // UI tests must launch the application that they test.
         let app = XCUIApplication()
+        // UI 테스트 중에는 CloudKit 동기화를 켜지 않는다.
+        app.launchArguments = ["-PiecePostDisableSync"]
         app.launch()
 
         // Use XCTAssert and related functions to verify your tests produce the correct results.
@@ -37,7 +39,9 @@ final class PiecePostUITests: XCTestCase {
     func testLaunchPerformance() throws {
         // This measures how long it takes to launch your application.
         measure(metrics: [XCTApplicationLaunchMetric()]) {
-            XCUIApplication().launch()
+            let app = XCUIApplication()
+            app.launchArguments = ["-PiecePostDisableSync"]
+            app.launch()
         }
     }
 }
