@@ -26,11 +26,7 @@ nonisolated final class StampFileStore: Sendable {
     }
 
     func save(_ photo: ProcessedPhoto) throws -> StoredPhotoPaths {
-        let name = "\(UUID().uuidString).heic"
-        let paths = StoredPhotoPaths(
-            photoPath: "\(Self.photosFolder)/\(name)",
-            thumbnailPath: "\(Self.thumbnailsFolder)/\(name)"
-        )
+        let paths = Self.newPaths()
         do {
             try write(photo.photo, to: paths.photoPath)
             try write(photo.thumbnail, to: paths.thumbnailPath)
@@ -39,6 +35,28 @@ nonisolated final class StampFileStore: Sendable {
             throw error
         }
         return paths
+    }
+
+    /// iCloud에서 받은 사진을 앱 폴더로 복사한다. CKAsset 파일은 임시라 받는 즉시 불러야 한다.
+    /// 사진은 이미 처리된 결과이므로 다시 인코딩하지 않는다.
+    func importFiles(photoFrom photoURL: URL, thumbnailFrom thumbnailURL: URL) throws -> StoredPhotoPaths {
+        let paths = Self.newPaths()
+        do {
+            try write(Data(contentsOf: photoURL), to: paths.photoPath)
+            try write(Data(contentsOf: thumbnailURL), to: paths.thumbnailPath)
+        } catch {
+            remove(paths.all)
+            throw error
+        }
+        return paths
+    }
+
+    private static func newPaths() -> StoredPhotoPaths {
+        let name = "\(UUID().uuidString).heic"
+        return StoredPhotoPaths(
+            photoPath: "\(photosFolder)/\(name)",
+            thumbnailPath: "\(thumbnailsFolder)/\(name)"
+        )
     }
 
     func url(for relativePath: String) -> URL {
