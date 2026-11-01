@@ -1,6 +1,12 @@
 import Foundation
 import SwiftData
 
+/// 엔진에 넣을 보낼 변경. 레코드 이름은 `StampRecordMapper.recordID(for:)`로 만든다.
+nonisolated enum PendingStampChange: Hashable, Sendable {
+    case save(date: String)
+    case delete(date: String)
+}
+
 /// 받은 우표를 어떻게 처리했는지. 로그에는 이 값만 남긴다(날짜·내용은 남기지 않음).
 nonisolated enum ReceiveOutcome: Equatable, Sendable {
     case inserted
@@ -25,6 +31,43 @@ final class SyncChangeApplier {
     init(context: ModelContext, fileStore: StampFileStore = StampFileStore()) {
         self.context = context
         self.fileStore = fileStore
+    }
+
+    // MARK: 보낼 변경
+
+    /// 아직 보내지 못한 변경 전부. 엔진 상태를 잃어도 이 목록으로 복구한다.
+    func pendingChanges() throws -> [PendingStampChange] {
+        let descriptor = FetchDescriptor<Stamp>(
+            predicate: #Predicate { $0.needsUpload },
+            sortBy: [SortDescriptor(\.date)]
+        )
+        return try context.fetch(descriptor).map { stamp in
+            stamp.pendingDeletion ? .delete(date: stamp.date) : .save(date: stamp.date)
+        }
+    }
+
+    /// 로컬에서 바뀐 날짜를 어떤 변경으로 보낼지. 행이 없거나 삭제 대기면 삭제.
+    func pendingChange(for date: String) throws -> PendingStampChange {
+        guard let stamp = try stamp(for: date), !stamp.pendingDeletion else {
+            return .delete(date: date)
+        }
+        return .save(date: date)
+    }
+
+    /// 업로드할 값. 행이 없거나 삭제 대기면 nil(보낼 목록에서 뺀다).
+    func uploadValues(for date: String) throws -> StampUploadValues? {
+        guard let stamp = try stamp(for: date), !stamp.pendingDeletion else { return nil }
+        return StampUploadValues(
+            date: stamp.date,
+            note: stamp.note,
+            createdAt: stamp.createdAt,
+            updatedAt: stamp.updatedAt,
+            schemaVersion: stamp.schemaVersion,
+            systemFields: stamp.systemFields,
+            photoNeedsUpload: stamp.photoNeedsUpload,
+            photoURL: fileStore.url(for: stamp.photoPath),
+            thumbnailURL: fileStore.url(for: stamp.thumbnailPath)
+        )
     }
 
     // MARK: 받은 변경

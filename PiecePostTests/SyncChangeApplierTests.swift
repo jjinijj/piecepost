@@ -208,4 +208,48 @@ struct SyncChangeApplierTests {
         #expect(recreated.needsUpload && recreated.photoNeedsUpload)
         #expect(recreated.note == "다시")
     }
+
+    // MARK: 보낼 변경
+
+    @Test func pendingChangesCoverSavesAndDeletes() throws {
+        try uploadedStamp(date: "2026-11-01")                                   // 보낼 것 없음
+        try store.create(date: "2026-11-02", note: "", photo: localPhoto)      // 저장
+        try uploadedStamp(date: "2026-11-03")
+        try store.delete(date: "2026-11-03")                                   // 삭제
+
+        #expect(try applier.pendingChanges() == [.save(date: "2026-11-02"), .delete(date: "2026-11-03")])
+    }
+
+    @Test func pendingChangeForDate() throws {
+        try uploadedStamp(date: "2026-11-01")
+        try uploadedStamp(date: "2026-11-02")
+        try store.delete(date: "2026-11-02")
+
+        #expect(try applier.pendingChange(for: "2026-11-01") == .save(date: "2026-11-01"))
+        #expect(try applier.pendingChange(for: "2026-11-02") == .delete(date: "2026-11-02"))
+        // 서버에 올라간 적 없어 바로 지워진 행
+        #expect(try applier.pendingChange(for: "2026-11-03") == .delete(date: "2026-11-03"))
+    }
+
+    @Test func uploadValuesReflectLocalStamp() throws {
+        let local = try uploadedStamp()
+        try store.updateNote(date: "2026-11-18", note: "수정", now: later)
+
+        let values = try #require(try applier.uploadValues(for: "2026-11-18"))
+
+        #expect(values.date == "2026-11-18")
+        #expect(values.note == "수정")
+        #expect(values.updatedAt == later)
+        #expect(values.systemFields == Data([1]))
+        #expect(!values.photoNeedsUpload)
+        #expect(values.photoURL == fileStore.url(for: local.photoPath))
+        #expect(values.thumbnailURL == fileStore.url(for: local.thumbnailPath))
+    }
+
+    @Test func uploadValuesAreNilForMissingOrDeleted() throws {
+        try uploadedStamp()
+        try store.delete(date: "2026-11-18")
+        #expect(try applier.uploadValues(for: "2026-11-18") == nil)
+        #expect(try applier.uploadValues(for: "2026-11-19") == nil)
+    }
 }
