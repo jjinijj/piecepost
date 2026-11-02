@@ -29,6 +29,9 @@ final class StampSyncEngine {
     /// 보낼 값을 읽다 오류가 나서 이번 보내기에서 뺀 레코드. 보내기가 끝나면 다시 예약한다.
     private var deferredSaves: Set<CKRecord.ID> = []
 
+    /// 보내기 진행 중 여부. "지금 보내기"가 진행 중인 보내기와 겹쳐 `sentInfo`를 덮어쓰지 않게 한다.
+    private var sendProgress = SendProgress()
+
     init(
         applier: SyncChangeApplier,
         stateStore: SyncStateStore = SyncStateStore(),
@@ -120,6 +123,12 @@ final class StampSyncEngine {
     func sendNow() async {
         guard let engine else { return }
         log.add("지금 보내기 요청")
+        guard sendProgress.beginManualSend() else {
+            // 겹치면 같은 레코드의 보낸 정보가 덮어써진다. 다시 넣기·보내기를 하지 않는다.
+            log.add("보내기 진행 중, 건너뜀")
+            return
+        }
+        defer { sendProgress.endManualSend() }
         do {
             for change in try applier.pendingChanges() {
                 enqueue(change, in: engine)
@@ -231,9 +240,11 @@ final class StampSyncEngine {
             Task { await retryFailedReceives() }
         case .willSendChanges(let will):
             monitor.status = .syncing
+            sendProgress.engineWillSend()
             log.add(SyncDiagnostics.sendStartLine(will.context.reason))
         case .didSendChanges:
             if monitor.status == .syncing { monitor.status = .idle }
+            sendProgress.engineDidSend()
             log.add("보내기 끝")
             if !deferredSaves.isEmpty {
                 log.add("읽기 실패로 미룬 저장 \(deferredSaves.count)건 다시 예약")
