@@ -89,6 +89,34 @@ struct SyncStatusStateTests {
         #expect(state.isQuotaExceeded)
     }
 
+    // MARK: 계정 세대
+
+    @Test func sameGenerationAllowsApplying() {
+        let generation = SyncAccountGeneration()
+        #expect(generation.allowsApplying(requestedAt: generation.value, isPaused: false))
+    }
+
+    @Test func pausedNeverAllowsApplying() {
+        let generation = SyncAccountGeneration()
+        #expect(!generation.allowsApplying(requestedAt: generation.value, isPaused: true))
+    }
+
+    @Test func changedGenerationRejectsResult() {
+        var generation = SyncAccountGeneration()
+        let requestedAt = generation.value
+        generation.advance()
+        #expect(!generation.allowsApplying(requestedAt: requestedAt, isPaused: false))
+    }
+
+    @Test func pausedAndResumedWhileWaitingRejectsResult() {
+        // 기다리는 사이 멈췄다가 재개: 지금은 멈춰 있지 않아도 버린다
+        var generation = SyncAccountGeneration()
+        let requestedAt = generation.value
+        generation.advance()  // 멈춤
+        generation.advance()  // 재개
+        #expect(!generation.allowsApplying(requestedAt: requestedAt, isPaused: false))
+    }
+
     // MARK: 포그라운드 진입
 
     @Test func launchCountsAsHandledEntry() {

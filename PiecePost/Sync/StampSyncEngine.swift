@@ -45,6 +45,9 @@ final class StampSyncEngine {
     /// 첫 동기화가 끝나면 기억할 계정 지문(`SyncAccountEvaluation.fingerprintToStoreAfterSync`).
     private var accountToRememberAfterSync: String?
 
+    /// 멈춤·재개와 엔진의 계정 알림 때 올라간다. `await` 뒤 결과를 반영해도 되는지 가른다.
+    private var accountGeneration = SyncAccountGeneration()
+
     init(
         applier: SyncChangeApplier,
         stateStore: SyncStateStore = SyncStateStore(),
@@ -132,12 +135,20 @@ final class StampSyncEngine {
 
     /// 계정 상태를 확인해 상태를 정한다. 앱 시작과 포그라운드 진입 때 부른다.
     /// 로그에는 상태 이름만 남기고 계정 식별자·지문은 남기지 않는다(불변 규칙 8).
+    ///
+    /// 기다리는 사이 엔진이 계정 변경을 알렸으면(세대가 바뀜) 돌아온 결과는 옛 계정 기준일 수 있어 버린다.
+    /// 그대로 쓰면 엔진이 막 멈춘 상태를 옛 계정 결과로 다시 풀 수 있다.
     private func checkAccount(_ container: CKContainer) async {
+        let requestedAt = accountGeneration.value
         let status: CKAccountStatus
         do {
             status = try await container.accountStatus()
         } catch {
             log.add("iCloud 계정 조회 실패: \(Self.describe(error))")
+            return
+        }
+        guard accountGeneration.value == requestedAt else {
+            log.add("계정 확인 중 계정 바뀜, 확인 결과 버림")
             return
         }
         log.add(SyncDiagnostics.accountStatusLine(status))
@@ -148,8 +159,16 @@ final class StampSyncEngine {
         }
         do {
             let userID = try await container.userRecordID()
+            guard accountGeneration.value == requestedAt else {
+                log.add("계정 확인 중 계정 바뀜, 확인 결과 버림")
+                return
+            }
             applyIdentity(currentUser: userID, previousUser: nil)
         } catch {
+            guard accountGeneration.value == requestedAt else {
+                log.add("계정 확인 중 계정 바뀜, 확인 결과 버림")
+                return
+            }
             // 계정을 비교하지 못했다. 멈춤 여부는 그대로 두고, 바뀐 계정은 엔진이 알려 주는 전환으로 잡는다.
             log.add("iCloud 사용자 확인 실패, 계정 비교 건너뜀: \(Self.describe(error))")
             setAccount(.available)
@@ -207,6 +226,7 @@ final class StampSyncEngine {
     private func setPaused(_ paused: Bool) {
         guard paused != isPaused else { return }
         statusState.isPausedForAccountChange = paused
+        accountGeneration.advance()
         if paused {
             log.add("계정 변경됨, 동기화 멈춤")
             // 새 계정으로 보낼 예약을 비운다. 로컬의 업로드 대기 표시(needsUpload)는 그대로라 재개 때 다시 넣는다.
@@ -331,6 +351,8 @@ final class StampSyncEngine {
     // MARK: 보내기
 
     fileprivate func recordToSave(_ recordID: CKRecord.ID, engine: CKSyncEngine) -> CKRecord? {
+        // 묶음을 만드는 사이 멈췄으면 넣지 않는다. 예약은 멈출 때 이미 비웠고 needsUpload 는 남아 있다.
+        guard !isPaused else { return nil }
         let values: StampUploadValues?
         do {
             values = try StampRecordMapper.date(from: recordID).flatMap(applier.uploadValues(for:))
@@ -422,6 +444,8 @@ final class StampSyncEngine {
     /// 로그아웃 → "iCloud 꺼짐". 로그인·계정 전환 → 기억한 계정과 비교해 같으면 정상(업로드 재개), 다르면 멈춤.
     /// 엔진은 로그아웃·전환 때 자기 예약을 비우므로, 계속 동기화할 때는 업로드 대기 우표를 다시 넣는다.
     private func handleAccountChange(_ change: CKSyncEngine.Event.AccountChange, engine: CKSyncEngine) {
+        // 기다리는 중인 계정 확인·다시 받기 결과는 이전 계정 기준일 수 있으니 버리게 한다.
+        accountGeneration.advance()
         switch change.changeType {
         case .signIn(let currentUser):
             log.add("계정 이벤트: 로그인")
@@ -553,11 +577,18 @@ final class StampSyncEngine {
 
         log.add("반영 실패 \(names.count)건 다시 받기")
         let ids = names.map { CKRecord.ID(recordName: $0, zoneID: StampRecordMapper.zoneID) }
+        let requestedAt = accountGeneration.value
         let results: [CKRecord.ID: Result<CKRecord, any Error>]
         do {
             results = try await database.records(for: ids)
         } catch {
             log.add("다시 받기 실패, 다음에 다시: \(Self.describe(error))")
+            return
+        }
+        // 기다리는 사이 계정이 바뀌었으면(멈췄다 재개된 경우 포함) 결과는 다른 계정 것일 수 있다.
+        // 하나도 반영·삭제하지 않고 목록을 그대로 둔다. 재개·다음 가져오기 끝에 다시 받는다.
+        guard accountGeneration.allowsApplying(requestedAt: requestedAt, isPaused: isPaused) else {
+            log.add("계정 변경됨, 다시 받기 결과 버림")
             return
         }
 
@@ -821,6 +852,8 @@ extension StampSyncEngine: CKSyncEngineDelegate {
         let batch = await CKSyncEngine.RecordZoneChangeBatch(pendingChanges: changes) { recordID in
             await self.recordToSave(recordID, engine: syncEngine)
         }
+        // 묶음을 만드는 동안(레코드마다 기다림) 멈췄으면 삭제 예약까지 포함해 아무것도 보내지 않는다.
+        guard await !isSendingPaused() else { return nil }
         await logBatch(batch)
         return batch
     }
