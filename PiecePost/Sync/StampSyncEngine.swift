@@ -13,7 +13,9 @@ final class StampSyncEngine {
     private let stateStore: SyncStateStore
     private let monitor: SyncMonitor
     private let retryList: ReceiveRetryList
+    private let accountStore: SyncAccountStore
     private var engine: CKSyncEngine?
+    private var container: CKContainer?
     private var database: CKDatabase?
     private var isRetryingReceives = false
     /// 다시 받기가 도는 중에 새로 요청됐는지. 끝난 뒤 한 번 더 돌린다(그사이 목록에 들어온 것이 다음 계기까지 묻히지 않게).
@@ -32,23 +34,50 @@ final class StampSyncEngine {
     /// 보내기 진행 중 여부. "지금 보내기"가 진행 중인 보내기와 겹쳐 `sentInfo`를 덮어쓰지 않게 한다.
     private var sendProgress = SendProgress()
 
+    /// 화면에 보낼 동기화 상태의 재료. 바뀔 때마다 `monitor.status`를 다시 정한다.
+    private var statusState = SyncStatusState() {
+        didSet { monitor.status = statusState.status }
+    }
+
+    /// 포그라운드 진입 한 번에 진입 처리를 한 번만 하게 한다.
+    private var foregroundGate = ForegroundEntryGate()
+
+    /// 첫 동기화가 끝나면 기억할 계정 지문(`SyncAccountEvaluation.fingerprintToStoreAfterSync`).
+    private var accountToRememberAfterSync: String?
+
     init(
         applier: SyncChangeApplier,
         stateStore: SyncStateStore = SyncStateStore(),
         retryList: ReceiveRetryList = ReceiveRetryList(),
+        accountStore: SyncAccountStore = SyncAccountStore(),
         monitor: SyncMonitor
     ) {
         self.applier = applier
         self.stateStore = stateStore
         self.retryList = retryList
+        self.accountStore = accountStore
         self.monitor = monitor
     }
 
     private var log: SyncLog { monitor.log }
 
+    /// 기억한 계정과 다른 Apple ID라 동기화를 멈췄는지. 멈춘 동안 보내지도, 받은 변경을 반영하지도 않는다.
+    private var isPaused: Bool { statusState.isPausedForAccountChange }
+
     // MARK: 시작
 
+    /// 계정을 먼저 확인하고 엔진을 만든다. 다른 계정이면 엔진이 받은 변경을 반영하거나 보내기 전에 멈춰 있어야 한다.
     func start() {
+        guard container == nil else { return }
+        let container = CKContainer(identifier: Self.containerIdentifier)
+        self.container = container
+        Task {
+            await checkAccount(container)
+            startEngine(container)
+        }
+    }
+
+    private func startEngine(_ container: CKContainer) {
         guard engine == nil else { return }
 
         let savedState: CKSyncEngine.State.Serialization?
@@ -61,7 +90,6 @@ final class StampSyncEngine {
         }
         log.add(savedState == nil ? "엔진 상태 없음, 처음부터 가져옴" : "엔진 상태 복원됨")
 
-        let container = CKContainer(identifier: Self.containerIdentifier)
         let database = container.privateCloudDatabase
         let configuration = CKSyncEngine.Configuration(
             database: database,
@@ -71,32 +99,150 @@ final class StampSyncEngine {
         let engine = CKSyncEngine(configuration)
         self.engine = engine
         self.database = database
+        statusState.isStarted = true
 
-        if savedState == nil {
-            engine.state.add(pendingDatabaseChanges: [.saveZone(CKRecordZone(zoneID: StampRecordMapper.zoneID))])
+        if isPaused {
+            // 다른 계정에 존을 만들거나 우표를 예약하지 않는다. 원래 계정으로 돌아오면 다시 넣는다.
+            log.add("계정 변경됨, 보낼 변경 예약 안 함")
+        } else {
+            if savedState == nil {
+                engine.state.add(pendingDatabaseChanges: [.saveZone(CKRecordZone(zoneID: StampRecordMapper.zoneID))])
+            }
+            // needsUpload 기준으로 다시 넣는다. 엔진 상태를 잃었어도 보내지 못한 변경이 복구된다.
+            enqueueAllPending(in: engine, logPrefix: "시작 시 보낼 변경")
         }
-        // needsUpload 기준으로 다시 넣는다. 엔진 상태를 잃었어도 보내지 못한 변경이 복구된다.
+        logPendingSummary(engine)
+        Task { await retryFailedReceives() }
+    }
+
+    /// 업로드 대기 우표를 모두 엔진에 넣고 개수를 남긴다. 읽기에 실패하면 엔진에 이미 있는 예약은 그대로 둔다.
+    private func enqueueAllPending(in engine: CKSyncEngine, logPrefix: String) {
         do {
             let pending = try applier.pendingChanges()
             for change in pending {
                 enqueue(change, in: engine)
             }
-            log.add("시작 시 보낼 변경 \(pending.count)건")
+            log.add("\(logPrefix) \(pending.count)건")
         } catch {
             log.add("보낼 변경 읽기 실패: \(Self.describe(error))")
         }
-        logPendingSummary(engine)
-        Task { await logAccountStatus(container) }
-        Task { await retryFailedReceives() }
     }
 
-    /// 앱 시작 때 계정 상태를 남긴다. 로그만 남기고 동작은 바꾸지 않는다(계정 상태 처리는 다음 작업).
-    private func logAccountStatus(_ container: CKContainer) async {
+    // MARK: 계정
+
+    /// 계정 상태를 확인해 상태를 정한다. 앱 시작과 포그라운드 진입 때 부른다.
+    /// 로그에는 상태 이름만 남기고 계정 식별자·지문은 남기지 않는다(불변 규칙 8).
+    private func checkAccount(_ container: CKContainer) async {
+        let status: CKAccountStatus
         do {
-            log.add(SyncDiagnostics.accountStatusLine(try await container.accountStatus()))
+            status = try await container.accountStatus()
         } catch {
             log.add("iCloud 계정 조회 실패: \(Self.describe(error))")
+            return
         }
+        log.add(SyncDiagnostics.accountStatusLine(status))
+        let condition = SyncAccountRules.condition(for: status)
+        guard condition == .available else {
+            setAccount(condition)
+            return
+        }
+        do {
+            let userID = try await container.userRecordID()
+            applyIdentity(currentUser: userID, previousUser: nil)
+        } catch {
+            // 계정을 비교하지 못했다. 멈춤 여부는 그대로 두고, 바뀐 계정은 엔진이 알려 주는 전환으로 잡는다.
+            log.add("iCloud 사용자 확인 실패, 계정 비교 건너뜀: \(Self.describe(error))")
+            setAccount(.available)
+        }
+    }
+
+    /// 지금 계정을 마지막으로 동기화한 계정과 비교해 멈추거나 재개한다.
+    private func applyIdentity(currentUser: CKRecord.ID, previousUser: CKRecord.ID?) {
+        let evaluation = SyncAccountRules.evaluate(
+            current: SyncAccountRules.fingerprint(ofUserRecordName: currentUser.recordName),
+            stored: accountStore.load(),
+            previous: previousUser.map { SyncAccountRules.fingerprint(ofUserRecordName: $0.recordName) },
+            engineHasHistory: engine != nil || hasSavedEngineState
+        )
+        if let fingerprint = evaluation.fingerprintToStore {
+            rememberAccount(fingerprint)
+        }
+        accountToRememberAfterSync = evaluation.fingerprintToStoreAfterSync
+        setPaused(evaluation.isDifferentAccount)
+        setAccount(.available)
+    }
+
+    private var hasSavedEngineState: Bool {
+        FileManager.default.fileExists(atPath: stateStore.fileURL.path(percentEncoded: false))
+    }
+
+    private func rememberAccount(_ fingerprint: String) {
+        do {
+            try accountStore.save(fingerprint)
+        } catch {
+            log.add("계정 기억 저장 실패: \(Self.describe(error))")
+        }
+    }
+
+    /// 미뤄 둔 첫 계정 기억. 가져오기·보내기가 끝났는데 엔진이 계정 전환을 알리지 않았으면 지금 계정이 맞다.
+    private func rememberAccountAfterSyncIfNeeded() {
+        guard let fingerprint = accountToRememberAfterSync, !isPaused else { return }
+        accountToRememberAfterSync = nil
+        if accountStore.load() == nil {
+            rememberAccount(fingerprint)
+            log.add("동기화한 계정 기억함")
+        }
+    }
+
+    private func setAccount(_ condition: SyncAccountCondition) {
+        let previous = statusState.account
+        statusState.account = condition
+        // 꺼짐·일시 사용 불가에서 돌아오면 업로드 대기 우표를 다시 예약한다(엔진이 로그아웃 때 예약을 비웠을 수 있음).
+        if condition == .available, previous == .signedOut || previous == .temporarilyUnavailable,
+           !isPaused, let engine {
+            enqueueAllPending(in: engine, logPrefix: "iCloud 사용 가능, 보낼 변경")
+        }
+    }
+
+    private func setPaused(_ paused: Bool) {
+        guard paused != isPaused else { return }
+        statusState.isPausedForAccountChange = paused
+        if paused {
+            log.add("계정 변경됨, 동기화 멈춤")
+            // 새 계정으로 보낼 예약을 비운다. 로컬의 업로드 대기 표시(needsUpload)는 그대로라 재개 때 다시 넣는다.
+            if let engine {
+                engine.state.remove(pendingRecordZoneChanges: engine.state.pendingRecordZoneChanges)
+                engine.state.remove(pendingDatabaseChanges: engine.state.pendingDatabaseChanges)
+            }
+        } else {
+            log.add("원래 계정으로 돌아옴, 동기화 재개")
+            if let engine {
+                enqueueAllPending(in: engine, logPrefix: "재개 시 보낼 변경")
+            }
+            Task { await retryFailedReceives() }
+        }
+    }
+
+    // MARK: 포그라운드
+
+    func appDidEnterBackground() {
+        foregroundGate.didEnterBackground()
+    }
+
+    /// 화면이 활성이 됐다. 포그라운드 진입 한 번에 한 번만 계정을 다시 확인하고, 용량 부족이면 한 번 다시 보낸다.
+    func appDidBecomeActive() {
+        guard let container, engine != nil, foregroundGate.shouldHandleActivation() else { return }
+        Task {
+            await checkAccount(container)
+            await retryAfterQuotaExceeded()
+        }
+    }
+
+    /// "용량 부족" 상태에서 업로드 대기 우표를 한 번 다시 보낸다(설계 문서 5장). 성공하면 보낸 결과에서 상태가 풀린다.
+    private func retryAfterQuotaExceeded() async {
+        guard statusState.isQuotaExceeded, statusState.account == .available, !isPaused else { return }
+        log.add("용량 부족, 포그라운드 진입으로 다시 보냄")
+        await send()
     }
 
     /// 엔진 대기 목록의 개수만 남긴다(레코드 이름은 남기지 않음).
@@ -111,6 +257,10 @@ final class StampSyncEngine {
     func fetchNow() async {
         guard let engine else { return }
         log.add("지금 가져오기 요청")
+        guard !isPaused else {
+            log.add("계정 변경됨, 가져오기 건너뜀")
+            return
+        }
         do {
             try await engine.fetchChanges()
         } catch {
@@ -121,22 +271,26 @@ final class StampSyncEngine {
     /// 보내기를 직접 시작한다. 엔진 상태에서 예약이 빠졌어도 로컬에 보낼 것(needsUpload)이 있으면 다시 넣고 보낸다.
     /// 엔진이 없으면(테스트 실행 등) 아무것도 하지 않는다.
     func sendNow() async {
-        guard let engine else { return }
+        guard engine != nil else { return }
         log.add("지금 보내기 요청")
+        await send()
+    }
+
+    /// 업로드 대기 우표를 다시 예약하고 보낸다. "지금 보내기"와 용량 부족 다시 보내기가 쓴다.
+    private func send() async {
+        guard let engine else { return }
+        guard !isPaused else {
+            log.add("계정 변경됨, 보내기 건너뜀")
+            return
+        }
         guard sendProgress.beginManualSend() else {
             // 겹치면 같은 레코드의 보낸 정보가 덮어써진다. 다시 넣기·보내기를 하지 않는다.
             log.add("보내기 진행 중, 건너뜀")
             return
         }
         defer { sendProgress.endManualSend() }
-        do {
-            for change in try applier.pendingChanges() {
-                enqueue(change, in: engine)
-            }
-        } catch {
-            // 다시 넣지 못해도 엔진에 이미 있는 예약은 보낸다.
-            log.add("보낼 변경 읽기 실패: \(Self.describe(error))")
-        }
+        // 다시 넣지 못해도 엔진에 이미 있는 예약은 보낸다.
+        enqueueAllPending(in: engine, logPrefix: "보낼 변경")
         logPendingSummary(engine)
         do {
             // 성공하면 보낸 결과 이벤트에서 "보냄: …" 요약 줄이 남는다.
@@ -151,6 +305,8 @@ final class StampSyncEngine {
     /// `StampStore.onLocalChange`에서 부른다.
     func localStampChanged(date: String) {
         guard let engine else { return }
+        // 멈춘 동안은 로컬에만 저장하고 업로드 대기(needsUpload)로 남긴다. 재개할 때 다시 넣는다.
+        guard !isPaused else { return }
         do {
             enqueue(try applier.pendingChange(for: date), in: engine)
         } catch {
@@ -232,20 +388,24 @@ final class StampSyncEngine {
             applySent(sent, engine: engine)
 
         case .willFetchChanges:
-            monitor.status = .syncing
+            statusState.isSyncing = true
+            statusState.errorCode = nil
             log.add("가져오기 시작")
         case .didFetchChanges:
-            if monitor.status == .syncing { monitor.status = .idle }
+            statusState.isSyncing = false
             log.add("가져오기 끝")
+            rememberAccountAfterSyncIfNeeded()
             Task { await retryFailedReceives() }
         case .willSendChanges(let will):
-            monitor.status = .syncing
+            statusState.isSyncing = true
+            statusState.errorCode = nil
             sendProgress.engineWillSend()
             log.add(SyncDiagnostics.sendStartLine(will.context.reason))
         case .didSendChanges:
-            if monitor.status == .syncing { monitor.status = .idle }
+            statusState.isSyncing = false
             sendProgress.engineDidSend()
             log.add("보내기 끝")
+            rememberAccountAfterSyncIfNeeded()
             if !deferredSaves.isEmpty {
                 log.add("읽기 실패로 미룬 저장 \(deferredSaves.count)건 다시 예약")
                 engine.state.add(pendingRecordZoneChanges: deferredSaves.map { .saveRecord($0) })
@@ -259,21 +419,21 @@ final class StampSyncEngine {
         }
     }
 
+    /// 로그아웃 → "iCloud 꺼짐". 로그인·계정 전환 → 기억한 계정과 비교해 같으면 정상(업로드 재개), 다르면 멈춤.
+    /// 엔진은 로그아웃·전환 때 자기 예약을 비우므로, 계속 동기화할 때는 업로드 대기 우표를 다시 넣는다.
     private func handleAccountChange(_ change: CKSyncEngine.Event.AccountChange, engine: CKSyncEngine) {
-        // 계정 상태 처리는 다음 PR(계정 상태)에서 정리한다. 지금은 로그와 상태 표시만.
         switch change.changeType {
-        case .signIn:
+        case .signIn(let currentUser):
             log.add("계정 이벤트: 로그인")
-            monitor.status = .idle
-            if let pending = try? applier.pendingChanges() {
-                for item in pending { enqueue(item, in: engine) }
-            }
+            applyIdentity(currentUser: currentUser, previousUser: nil)
+            if !isPaused { enqueueAllPending(in: engine, logPrefix: "로그인 후 보낼 변경") }
         case .signOut:
             log.add("계정 이벤트: 로그아웃")
-            monitor.status = .iCloudUnavailable
-        case .switchAccounts:
+            setAccount(.signedOut)
+        case .switchAccounts(let previousUser, let currentUser):
             log.add("계정 이벤트: 계정 전환")
-            monitor.status = .iCloudUnavailable
+            applyIdentity(currentUser: currentUser, previousUser: previousUser)
+            if !isPaused { enqueueAllPending(in: engine, logPrefix: "계정 전환 후 보낼 변경") }
         @unknown default:
             log.add("계정 이벤트: 알 수 없음")
         }
@@ -282,6 +442,11 @@ final class StampSyncEngine {
     // MARK: 받은 변경
 
     private func applyFetched(_ changes: CKSyncEngine.Event.FetchedRecordZoneChanges) {
+        guard !isPaused else {
+            // 다른 계정의 데이터가 로컬과 섞이지 않게 한다. 원래 계정으로 돌아오면 엔진이 처음부터 다시 받는다.
+            log.add("계정 변경됨, 받은 변경 반영 안 함: 변경 \(changes.modifications.count), 삭제 \(changes.deletions.count)")
+            return
+        }
         var inserted = 0, updated = 0, conflicts = 0, skippedDeletion = 0, deleted = 0, failed = 0, retryLater = 0
         var applied: [String] = []
 
@@ -368,6 +533,8 @@ final class StampSyncEngine {
     /// 반영에 실패했던 레코드만 iCloud에서 직접 다시 받아 반영한다. 앱 시작, 가져오기 끝, 보내기 충돌 처리 실패 때 부른다.
     func retryFailedReceives() async {
         guard let database else { return }
+        // 멈춘 동안 다시 받으면 새 계정에서 받게 된다. 목록은 남겨 두고 재개 때 다시 받는다.
+        guard !isPaused else { return }
         guard !isRetryingReceives else {
             receiveRetryRequestedWhileRunning = true
             return
@@ -457,12 +624,7 @@ final class StampSyncEngine {
         }
 
         for id in sent.deletedRecordIDs {
-            guard let date = StampRecordMapper.date(from: id) else { continue }
-            do {
-                try applier.markDeleted(date: date)
-            } catch {
-                log.add("삭제 결과 반영 실패: \(Self.describe(error))")
-            }
+            markDeleted(id)
         }
 
         for failure in sent.failedRecordSaves {
@@ -471,10 +633,17 @@ final class StampSyncEngine {
             handleFailedSave(id: id, error: failure.error, sentInfo: info, engine: engine)
         }
 
-        for (_, error) in sent.failedRecordDeletes {
-            // 처리 방식이 정해지지 않은 경우라 로그만 남긴다.
-            log.add("삭제 실패: \(Self.describe(error))")
+        for (id, error) in sent.failedRecordDeletes {
+            handleFailedDelete(id: id, error: error)
         }
+
+        // 용량 부족 실패가 없고 하나라도 올라갔으면 "용량 부족"을 푼다.
+        let quotaFailures = sent.failedRecordSaves.filter { $0.error.code == .quotaExceeded }.count
+            + sent.failedRecordDeletes.values.filter { $0.code == .quotaExceeded }.count
+        statusState.recordSendResult(
+            succeeded: sent.savedRecords.count + sent.deletedRecordIDs.count,
+            quotaFailures: quotaFailures
+        )
 
         log.add(
             "보냄: 저장 \(saved), 옛 결과 무시 \(ignored), 삭제 \(sent.deletedRecordIDs.count), "
@@ -505,17 +674,45 @@ final class StampSyncEngine {
             resolveSaveConflict(id: id, error: error, sentInfo: sentInfo, engine: engine)
 
         case .quotaExceeded:
-            monitor.status = .quotaExceeded
+            statusState.isQuotaExceeded = true
             log.add("저장 실패 quotaExceeded: 로컬 유지")
 
         case .notAuthenticated:
-            monitor.status = .iCloudUnavailable
+            setAccount(.signedOut)
             log.add("저장 실패 notAuthenticated: 로컬에만 저장")
 
         default:
             // 판단 분기에 없는 코드. 처리 방식은 정하지 않고 보고한다.
-            monitor.status = .error(code: error.code.rawValue)
+            statusState.errorCode = error.code.rawValue
             log.add("저장 실패(처리 방식 미정): \(Self.describe(error))")
+        }
+    }
+
+    private func markDeleted(_ id: CKRecord.ID) {
+        guard let date = StampRecordMapper.date(from: id) else { return }
+        do {
+            try applier.markDeleted(date: date)
+        } catch {
+            log.add("삭제 결과 반영 실패: \(Self.describe(error))")
+        }
+    }
+
+    /// 삭제 실패. 로컬의 삭제 대기 행(pendingDeletion·needsUpload)은 지우지 않으므로 다시 보낼 때 다시 예약된다.
+    private func handleFailedDelete(id: CKRecord.ID, error: CKError) {
+        switch DeleteFailureAction.action(for: error.code) {
+        case .keepPendingForRetry:
+            log.add("삭제 실패(재시도 대기): \(Self.describe(error))")
+        case .quotaExceeded:
+            statusState.isQuotaExceeded = true
+            log.add("삭제 실패 quotaExceeded: 삭제 대기 유지")
+        case .signedOut:
+            setAccount(.signedOut)
+            log.add("삭제 실패 notAuthenticated: 삭제 대기 유지")
+        case .treatAsDeleted:
+            log.add("삭제 실패 unknownItem: 서버에 이미 없음, 삭제 완료로 처리")
+            markDeleted(id)
+        case .unhandled:
+            log.add("삭제 실패(처리 방식 미정), 삭제 대기 유지: \(Self.describe(error))")
         }
     }
 
@@ -584,6 +781,13 @@ extension StampSyncEngine {
         log.add("보낼 묶음 요청 받음")
     }
 
+    /// 계정 변경으로 멈췄으면 로그를 남기고 true.
+    fileprivate func isSendingPaused() -> Bool {
+        guard isPaused else { return false }
+        log.add("계정 변경됨, 보낼 묶음 없음")
+        return true
+    }
+
     fileprivate func logBatch(_ batch: CKSyncEngine.RecordZoneChangeBatch?) {
         log.add(SyncDiagnostics.batchSummary(
             saves: batch?.recordsToSave.count ?? 0,
@@ -604,6 +808,10 @@ extension StampSyncEngine: CKSyncEngineDelegate {
         syncEngine: CKSyncEngine
     ) async -> CKSyncEngine.RecordZoneChangeBatch? {
         await logBatchRequest()
+        guard await !isSendingPaused() else {
+            // 멈춘 동안은 어떤 우표도 보내지 않는다(새 계정에 올라가지 않게).
+            return nil
+        }
         let scope = context.options.scope
         let changes = syncEngine.state.pendingRecordZoneChanges.filter { scope.contains($0) }
         guard !changes.isEmpty else {

@@ -55,6 +55,21 @@ struct SyncAccountRulesTests {
         #expect(result == SyncAccountEvaluation(isDifferentAccount: true, fingerprintToStore: "A"))
     }
 
+    @Test func firstAccountWaitsForSyncWhenEngineHasHistory() {
+        // 기억하기 전 빌드에서 올라옴: 엔진 상태의 계정이 다를 수 있어 지금은 기억하지 않는다
+        let result = SyncAccountRules.evaluate(current: "B", stored: nil, previous: nil, engineHasHistory: true)
+        #expect(result == SyncAccountEvaluation(
+            isDifferentAccount: false,
+            fingerprintToStore: nil,
+            fingerprintToStoreAfterSync: "B"
+        ))
+    }
+
+    @Test func engineHistoryDoesNotMatterOnceRemembered() {
+        let result = SyncAccountRules.evaluate(current: "B", stored: "A", previous: nil, engineHasHistory: true)
+        #expect(result == SyncAccountEvaluation(isDifferentAccount: true, fingerprintToStore: nil))
+    }
+
     @Test func fingerprintIsStableAndHidesName() {
         let name = "_0123456789abcdef"
         let fingerprint = SyncAccountRules.fingerprint(ofUserRecordName: name)

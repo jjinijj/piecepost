@@ -19,6 +19,9 @@ struct SyncAccountEvaluation: Equatable {
     let isDifferentAccount: Bool
     /// 기기에 새로 기억할 계정 지문. 바꿀 것이 없으면 nil
     let fingerprintToStore: String?
+    /// 지금 기억하지 않고 첫 동기화(가져오기·보내기 끝)까지 미뤘다가 기억할 지문.
+    /// 엔진 상태에 이전 계정이 남아 있을 수 있어, 엔진이 계정 전환을 알릴 기회를 먼저 준다.
+    var fingerprintToStoreAfterSync: String? = nil
 }
 
 /// 계정 상태와 계정 비교 규칙. CloudKit 서버 없이 확인할 수 있게 엔진과 떼어 둔다.
@@ -36,14 +39,24 @@ enum SyncAccountRules {
     /// 지금 계정을 마지막으로 동기화한 계정과 비교한다.
     ///
     /// 기준은 기기에 기억한 계정이고, 없으면 엔진이 알려 준 이전 계정(엔진 상태가 기억하는 마지막 계정)이다.
-    /// 둘 다 없으면 처음 동기화하는 것이므로 지금 계정을 기억한다.
+    /// 둘 다 없으면 처음 동기화하는 것이므로 지금 계정을 기억한다. 단 엔진 상태가 이미 있으면(계정을 기억하기 전
+    /// 빌드에서 올라온 경우) 엔진 상태에 남은 계정이 지금과 다를 수 있으므로 첫 동기화가 끝난 뒤에 기억한다.
+    /// 그사이 엔진이 계정 전환을 알리면 그때 준 이전 계정이 기준이 된다.
     /// - Parameters:
     ///   - current: 지금 계정의 지문
     ///   - stored: 기기에 기억한 계정의 지문
     ///   - previous: 엔진이 계정 전환을 알릴 때 준 이전 계정의 지문
-    static func evaluate(current: String, stored: String?, previous: String?) -> SyncAccountEvaluation {
+    ///   - engineHasHistory: 저장된 엔진 상태가 있거나 엔진이 이미 돌고 있는지
+    static func evaluate(
+        current: String,
+        stored: String?,
+        previous: String?,
+        engineHasHistory: Bool = false
+    ) -> SyncAccountEvaluation {
         guard let baseline = stored ?? previous else {
-            return SyncAccountEvaluation(isDifferentAccount: false, fingerprintToStore: current)
+            return engineHasHistory
+                ? SyncAccountEvaluation(isDifferentAccount: false, fingerprintToStore: nil, fingerprintToStoreAfterSync: current)
+                : SyncAccountEvaluation(isDifferentAccount: false, fingerprintToStore: current)
         }
         // 기억한 것이 없었으면 기준으로 삼은 계정을 기억해 다음 확인에도 쓴다.
         let toStore = stored == nil ? baseline : nil

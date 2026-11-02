@@ -11,6 +11,7 @@ import SwiftData
 @main
 struct PiecePostApp: App {
     @UIApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
+    @Environment(\.scenePhase) private var scenePhase
 
     let modelContainer: ModelContainer
     let stampStore: StampStore
@@ -46,6 +47,14 @@ struct PiecePostApp: App {
             )
         }
         .modelContainer(modelContainer)
+        .onChange(of: scenePhase) { _, phase in
+            // 포그라운드 진입 때 계정을 다시 확인하고, 용량 부족이면 한 번 다시 보낸다(설계 문서 5장).
+            switch phase {
+            case .background: syncEngine?.appDidEnterBackground()
+            case .active: syncEngine?.appDidBecomeActive()
+            default: break
+            }
+        }
     }
 
     /// 단위 테스트(앱 안에서 실행) 또는 UI 테스트(실행 인자로 알림) 중이면 true.
