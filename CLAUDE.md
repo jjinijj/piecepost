@@ -38,11 +38,10 @@
 ## 판단 분기
 - CloudKit 오류가 `networkUnavailable`·`networkFailure`면 → `needsUpload` 유지, 재시도는 CKSyncEngine에 맡김
 - `quotaExceeded`면 → 동기화 상태를 "용량 부족"으로 바꾸고 로컬 데이터는 유지
-- `serverRecordChanged`면 → `updatedAt`이 늦은 쪽을 남김. 삭제와 수정이 충돌하면 삭제 우선
+- `serverRecordChanged`면 → `updatedAt`이 늦은 쪽을 남김. 삭제와 수정이 충돌하면 삭제 우선. 밀린 쪽 내용은 보관·안내하지 않고 버림(로그에 상태만)
 - `notAuthenticated` 또는 계정 상태 `noAccount`·`restricted`면 → "iCloud 꺼짐" 상태, 로컬에만 저장
 - 위에 없는 오류 코드면 → 로그를 남기고, 처리 방식은 추측하지 말고 질문
 - 아래 미결정 항목을 건드리는 구현이면 → 임의로 정하지 말고 멈추고 질문
-  - 충돌 시 밀린 쪽 내용 보관·안내 여부
   - iCloud 계정 변경 시 미업로드 데이터 처리
   - 수정 모드의 "자르기" 버튼 처리
 - 설계 문서와 요청이 다르거나 문서에 없는 결정이 필요하면 → 추측하지 말고 질문

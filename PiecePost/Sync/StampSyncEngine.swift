@@ -16,6 +16,8 @@ final class StampSyncEngine {
     private var engine: CKSyncEngine?
     private var database: CKDatabase?
     private var isRetryingReceives = false
+    /// 다시 받기가 도는 중에 새로 요청됐는지. 끝난 뒤 한 번 더 돌린다(그사이 목록에 들어온 것이 다음 계기까지 묻히지 않게).
+    private var receiveRetryRequestedWhileRunning = false
 
     /// 보낸 레코드의 결과를 받을 때 필요한 값. 결과 콜백에는 "보낼 때" 값이 없으므로 여기 기억해 둔다.
     private struct SentInfo {
@@ -225,7 +227,7 @@ final class StampSyncEngine {
     // MARK: 받은 변경
 
     private func applyFetched(_ changes: CKSyncEngine.Event.FetchedRecordZoneChanges) {
-        var inserted = 0, updated = 0, skippedPending = 0, skippedDeletion = 0, deleted = 0, failed = 0, retryLater = 0
+        var inserted = 0, updated = 0, conflicts = 0, skippedDeletion = 0, deleted = 0, failed = 0, retryLater = 0
         var applied: [String] = []
 
         for modification in changes.modifications {
@@ -237,12 +239,15 @@ final class StampSyncEngine {
                     log.add("더 높은 schemaVersion=\(received.schemaVersion) 받음, 아는 필드만 반영")
                 }
                 // 사진 임시 파일은 이 콜백 안에서만 유효하므로 여기서 바로 복사한다.
-                switch try applier.applyReceived(received) {
+                let outcome = try applier.applyReceived(received)
+                switch outcome {
                 case .inserted: inserted += 1
                 case .updated: updated += 1
-                case .skippedLocalPending: skippedPending += 1
+                case .conflictServerWon, .conflictLocalWon: conflicts += 1
                 case .skippedPendingDeletion: skippedDeletion += 1
+                case .skippedStaleResult: break  // 보낸 결과 판정에서만 나온다
                 }
+                followUpReceive(outcome, recordID: record.recordID)
                 applied.append(record.recordID.recordName)
             } catch let error as StampRecordError {
                 // 형식이 잘못된 레코드는 다시 받아도 같으므로 건너뛴다(합의된 동작).
@@ -270,10 +275,24 @@ final class StampSyncEngine {
         // 다시 받기 목록에 있던 것이 정상으로 반영됐으면 목록에서 뺀다.
         try? retryList.remove(applied)
         log.add(
-            "받음: 추가 \(inserted), 갱신 \(updated), 삭제 \(deleted), "
-                + "건너뜀(로컬 대기 \(skippedPending), 삭제 대기 \(skippedDeletion)), "
+            "받음: 추가 \(inserted), 갱신 \(updated), 충돌 \(conflicts), 삭제 \(deleted), "
+                + "건너뜀(삭제 대기 \(skippedDeletion)), "
                 + "형식 오류 \(failed), 다시 받기 \(retryLater)"
         )
+    }
+
+    /// 받기 충돌 결과에 맞게 엔진의 보낼 목록을 맞춘다. 로그에는 상태만 남긴다(날짜·내용 금지).
+    private func followUpReceive(_ outcome: ReceiveOutcome, recordID: CKRecord.ID) {
+        switch outcome {
+        case .conflictServerWon:
+            log.add("받기 충돌: 서버 채택")
+            engine?.state.remove(pendingRecordZoneChanges: [.saveRecord(recordID)])
+        case .conflictLocalWon(let resendsPhoto):
+            log.add(resendsPhoto ? "받기 충돌: 로컬 채택, 사진도 다시 보냄" : "받기 충돌: 로컬 채택")
+            engine?.state.add(pendingRecordZoneChanges: [.saveRecord(recordID)])
+        case .inserted, .updated, .skippedPendingDeletion, .skippedStaleResult:
+            break
+        }
     }
 
     private func markForRetry(_ recordID: CKRecord.ID, error: any Error) {
@@ -285,13 +304,30 @@ final class StampSyncEngine {
         }
     }
 
-    /// 반영에 실패했던 레코드만 iCloud에서 직접 다시 받아 반영한다. 앱 시작과 가져오기 끝에 부른다.
+    /// 다시 받기 목록에 넣고 다음 계기를 기다리지 않고 바로 다시 받는다. 보내기 충돌을 처리하지 못했을 때 쓴다.
+    private func markForRetryAndStart(_ recordID: CKRecord.ID, error: any Error) {
+        markForRetry(recordID, error: error)
+        Task { await retryFailedReceives() }
+    }
+
+    /// 반영에 실패했던 레코드만 iCloud에서 직접 다시 받아 반영한다. 앱 시작, 가져오기 끝, 보내기 충돌 처리 실패 때 부른다.
     func retryFailedReceives() async {
-        guard !isRetryingReceives, let database else { return }
+        guard let database else { return }
+        guard !isRetryingReceives else {
+            receiveRetryRequestedWhileRunning = true
+            return
+        }
         let names = retryList.names()
         guard !names.isEmpty else { return }
         isRetryingReceives = true
-        defer { isRetryingReceives = false }
+        defer {
+            isRetryingReceives = false
+            // 도는 중에 들어온 요청은 한 번만 이어서 처리한다. 실패해 남은 것은 요청을 만들지 않으므로 반복되지 않는다.
+            if receiveRetryRequestedWhileRunning {
+                receiveRetryRequestedWhileRunning = false
+                Task { await retryFailedReceives() }
+            }
+        }
 
         log.add("반영 실패 \(names.count)건 다시 받기")
         let ids = names.map { CKRecord.ID(recordName: $0, zoneID: StampRecordMapper.zoneID) }
@@ -310,7 +346,8 @@ final class StampSyncEngine {
             case .success(let record):
                 do {
                     // 사진 임시 파일이 사라지기 전에 바로 반영(복사)한다.
-                    try applier.applyReceived(try StampRecordMapper.receivedStamp(from: record))
+                    let outcome = try applier.applyReceived(try StampRecordMapper.receivedStamp(from: record))
+                    followUpReceive(outcome, recordID: id)
                     recovered += 1
                     finished.append(id.recordName)
                 } catch is StampRecordError {
@@ -375,8 +412,8 @@ final class StampSyncEngine {
 
         for failure in sent.failedRecordSaves {
             let id = failure.record.recordID
-            sentInfo.removeValue(forKey: id)
-            handleFailedSave(id: id, error: failure.error, engine: engine)
+            let info = sentInfo.removeValue(forKey: id)
+            handleFailedSave(id: id, error: failure.error, sentInfo: info, engine: engine)
         }
 
         for (_, error) in sent.failedRecordDeletes {
@@ -390,7 +427,7 @@ final class StampSyncEngine {
         )
     }
 
-    private func handleFailedSave(id: CKRecord.ID, error: CKError, engine: CKSyncEngine) {
+    private func handleFailedSave(id: CKRecord.ID, error: CKError, sentInfo: SentInfo?, engine: CKSyncEngine) {
         switch error.code {
         case .zoneNotFound:
             // 존을 만들고 다시 보낸다.
@@ -410,8 +447,7 @@ final class StampSyncEngine {
             log.add("저장 실패(재시도 대기): \(Self.describe(error))")
 
         case .serverRecordChanged:
-            // 충돌 처리 PR에서 처리한다. needsUpload가 남아 있어 다음 실행 때 다시 시도된다.
-            log.add("저장 실패 serverRecordChanged: 충돌 처리 미구현, 로그만")
+            resolveSaveConflict(id: id, error: error, sentInfo: sentInfo, engine: engine)
 
         case .quotaExceeded:
             monitor.status = .quotaExceeded
@@ -425,6 +461,48 @@ final class StampSyncEngine {
             // 판단 분기에 없는 코드. 처리 방식은 정하지 않고 보고한다.
             monitor.status = .error(code: error.code.rawValue)
             log.add("저장 실패(처리 방식 미정): \(Self.describe(error))")
+        }
+    }
+
+    /// `updatedAt`이 늦은 쪽을 남긴다. 로그에는 상태만 남긴다(날짜·내용·레코드 이름 금지).
+    private func resolveSaveConflict(id: CKRecord.ID, error: CKError, sentInfo: SentInfo?, engine: CKSyncEngine) {
+        guard let sentInfo else {
+            // 보낼 때 기준을 모르면 옛 결과인지 가릴 수 없다. 판정하지 않고 다시 보내 새 결과로 판정한다.
+            // 보낼 변경이 없으면 보낼 값이 nil이라 예약에서 빠진다.
+            log.add("충돌 serverRecordChanged: 보낸 정보 없음, 다시 보냄")
+            engine.state.add(pendingRecordZoneChanges: [.saveRecord(id)])
+            return
+        }
+        // 오류에 서버 레코드가 없거나 읽을 수 없으면(사진 Asset이 빠진 경우 포함) 직접 다시 받아
+        // 받기 충돌 규칙으로 처리한다. 다시 받아도 형식이 잘못됐으면 다시 받기에서 건너뛴다.
+        guard let serverRecord = error.serverRecord,
+              let server = try? StampRecordMapper.receivedStamp(from: serverRecord)
+        else {
+            log.add("충돌 serverRecordChanged: 서버 레코드를 읽지 못함, 다시 받기")
+            markForRetryAndStart(id, error: error)
+            return
+        }
+        do {
+            switch try applier.resolveSaveConflict(server: server, sentBaseSystemFields: sentInfo.baseSystemFields) {
+            case .conflictLocalWon(let resendsPhoto):
+                log.add(resendsPhoto
+                    ? "충돌 serverRecordChanged: 로컬 채택, 사진도 다시 보냄"
+                    : "충돌 serverRecordChanged: 로컬 채택")
+                engine.state.add(pendingRecordZoneChanges: [.saveRecord(id)])
+            case .conflictServerWon, .updated, .inserted:
+                log.add("충돌 serverRecordChanged: 서버 채택")
+                engine.state.remove(pendingRecordZoneChanges: [.saveRecord(id)])
+            case .skippedPendingDeletion:
+                log.add("충돌 serverRecordChanged: 로컬 삭제 대기, 삭제 우선")
+            case .skippedStaleResult:
+                // 로컬이 이미 더 새 상태. 보낼 변경이 남아 있으면 지금 기준으로 다시 보내고, 없으면 예약에서 빠진다.
+                log.add("충돌 serverRecordChanged: 옛 결과, 반영 안 함")
+                engine.state.add(pendingRecordZoneChanges: [.saveRecord(id)])
+            }
+        } catch {
+            // 사진 복사·저장 실패처럼 다시 하면 될 수 있는 실패. 바로 다시 받아 받기 충돌 규칙으로 처리한다.
+            // 다시 받기에서도 반영에 실패하면 목록에 남기만 하고 보내기를 예약하지 않으므로 반복되지 않는다.
+            markForRetryAndStart(id, error: error)
         }
     }
 
