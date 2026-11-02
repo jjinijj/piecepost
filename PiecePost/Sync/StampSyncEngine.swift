@@ -115,6 +115,28 @@ final class StampSyncEngine {
         }
     }
 
+    /// 보내기를 직접 시작한다. 엔진 상태에서 예약이 빠졌어도 로컬에 보낼 것(needsUpload)이 있으면 다시 넣고 보낸다.
+    /// 엔진이 없으면(테스트 실행 등) 아무것도 하지 않는다.
+    func sendNow() async {
+        guard let engine else { return }
+        log.add("지금 보내기 요청")
+        do {
+            for change in try applier.pendingChanges() {
+                enqueue(change, in: engine)
+            }
+        } catch {
+            // 다시 넣지 못해도 엔진에 이미 있는 예약은 보낸다.
+            log.add("보낼 변경 읽기 실패: \(Self.describe(error))")
+        }
+        logPendingSummary(engine)
+        do {
+            // 성공하면 보낸 결과 이벤트에서 "보냄: …" 요약 줄이 남는다.
+            try await engine.sendChanges()
+        } catch {
+            log.add("보내기 실패: \(Self.describe(error))")
+        }
+    }
+
     // MARK: 로컬 변경
 
     /// `StampStore.onLocalChange`에서 부른다.
