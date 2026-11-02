@@ -22,7 +22,8 @@ final class SyncLog {
     private let logger = Logger(subsystem: Bundle.main.bundleIdentifier ?? "PiecePost", category: "sync")
 
     func add(_ message: String, now: Date = .now) {
-        logger.info("\(message, privacy: .public)")
+        // info 수준은 맥의 `log show`에 기본으로 남지 않는다. 기본 저장 수준(notice)으로 남긴다.
+        logger.notice("\(message, privacy: .public)")
         entries.insert(Entry(time: now, message: message), at: 0)
         if entries.count > Self.maxEntries {
             entries.removeLast(entries.count - Self.maxEntries)

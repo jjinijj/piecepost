@@ -38,9 +38,12 @@ struct PiecePostApp: App {
 
     var body: some Scene {
         WindowGroup {
-            SyncSpikeView(store: stampStore, monitor: syncMonitor) { [syncEngine] in
-                await syncEngine?.fetchNow()
-            }
+            SyncSpikeView(
+                store: stampStore,
+                monitor: syncMonitor,
+                fetchNow: { [syncEngine] in await syncEngine?.fetchNow() },
+                sendNow: { [syncEngine] in await syncEngine?.sendNow() }
+            )
         }
         .modelContainer(modelContainer)
     }

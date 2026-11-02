@@ -8,6 +8,8 @@ struct SyncSpikeView: View {
     let monitor: SyncMonitor
     /// 시뮬레이터처럼 푸시를 잘 받지 못하는 환경에서 수동으로 가져온다.
     let fetchNow: () async -> Void
+    /// 엔진 상태에서 보내기 예약이 빠졌을 때 수동으로 다시 보낸다.
+    let sendNow: () async -> Void
 
     @Query(
         filter: #Predicate<Stamp> { !$0.pendingDeletion },
@@ -20,6 +22,7 @@ struct SyncSpikeView: View {
     @State private var editingStamp: Stamp?
     @State private var errorMessage: String?
     @State private var isFetching = false
+    @State private var isSending = false
 
     var body: some View {
         NavigationStack {
@@ -42,6 +45,22 @@ struct SyncSpikeView: View {
                         }
                     }
                     .disabled(isFetching || monitor.status == .notStarted)
+                    Button {
+                        Task {
+                            isSending = true
+                            await sendNow()
+                            isSending = false
+                        }
+                    } label: {
+                        HStack {
+                            Text("지금 보내기")
+                            if isSending {
+                                Spacer()
+                                ProgressView()
+                            }
+                        }
+                    }
+                    .disabled(isSending || monitor.status == .notStarted)
                 }
 
                 Section("우표 \(stamps.count)장") {
@@ -148,6 +167,6 @@ private struct StampRow: View {
         for: Stamp.self,
         configurations: ModelConfiguration(isStoredInMemoryOnly: true, cloudKitDatabase: .none)
     )
-    SyncSpikeView(store: StampStore(context: container.mainContext), monitor: SyncMonitor()) {}
+    SyncSpikeView(store: StampStore(context: container.mainContext), monitor: SyncMonitor(), fetchNow: {}, sendNow: {})
         .modelContainer(container)
 }

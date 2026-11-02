@@ -35,6 +35,23 @@ final class PiecePostUITests: XCTestCase {
         // https://developer.apple.com/documentation/xcuiautomation
     }
 
+    /// 동기화를 끈 실행(엔진 없음)에서도 두 버튼이 보이고, 앱이 멈추지 않는다.
+    @MainActor
+    func testSyncButtonsWithoutEngine() throws {
+        let app = XCUIApplication()
+        app.launchArguments = ["-PiecePostDisableSync"]
+        app.launch()
+
+        let fetch = app.buttons["지금 가져오기"]
+        let send = app.buttons["지금 보내기"]
+        XCTAssertTrue(fetch.waitForExistence(timeout: 5))
+        XCTAssertTrue(send.exists)
+        // 엔진이 없으면 연결 전 상태라 눌러도 아무 일이 없다.
+        XCTAssertFalse(send.isEnabled)
+        send.tap()
+        XCTAssertTrue(app.navigationBars["동기화 시험"].exists)
+    }
+
     @MainActor
     func testLaunchPerformance() throws {
         // This measures how long it takes to launch your application.

@@ -29,6 +29,9 @@ final class StampSyncEngine {
     /// 보낼 값을 읽다 오류가 나서 이번 보내기에서 뺀 레코드. 보내기가 끝나면 다시 예약한다.
     private var deferredSaves: Set<CKRecord.ID> = []
 
+    /// 보내기 진행 중 여부. "지금 보내기"가 진행 중인 보내기와 겹쳐 `sentInfo`를 덮어쓰지 않게 한다.
+    private var sendProgress = SendProgress()
+
     init(
         applier: SyncChangeApplier,
         stateStore: SyncStateStore = SyncStateStore(),
@@ -58,7 +61,8 @@ final class StampSyncEngine {
         }
         log.add(savedState == nil ? "엔진 상태 없음, 처음부터 가져옴" : "엔진 상태 복원됨")
 
-        let database = CKContainer(identifier: Self.containerIdentifier).privateCloudDatabase
+        let container = CKContainer(identifier: Self.containerIdentifier)
+        let database = container.privateCloudDatabase
         let configuration = CKSyncEngine.Configuration(
             database: database,
             stateSerialization: savedState,
@@ -81,7 +85,26 @@ final class StampSyncEngine {
         } catch {
             log.add("보낼 변경 읽기 실패: \(Self.describe(error))")
         }
+        logPendingSummary(engine)
+        Task { await logAccountStatus(container) }
         Task { await retryFailedReceives() }
+    }
+
+    /// 앱 시작 때 계정 상태를 남긴다. 로그만 남기고 동작은 바꾸지 않는다(계정 상태 처리는 다음 작업).
+    private func logAccountStatus(_ container: CKContainer) async {
+        do {
+            log.add(SyncDiagnostics.accountStatusLine(try await container.accountStatus()))
+        } catch {
+            log.add("iCloud 계정 조회 실패: \(Self.describe(error))")
+        }
+    }
+
+    /// 엔진 대기 목록의 개수만 남긴다(레코드 이름은 남기지 않음).
+    private func logPendingSummary(_ engine: CKSyncEngine) {
+        log.add(SyncDiagnostics.pendingSummary(
+            recordZoneChanges: engine.state.pendingRecordZoneChanges,
+            databaseChanges: engine.state.pendingDatabaseChanges
+        ))
     }
 
     /// 시뮬레이터처럼 푸시를 잘 받지 못하는 환경을 위한 수동 가져오기.
@@ -92,6 +115,34 @@ final class StampSyncEngine {
             try await engine.fetchChanges()
         } catch {
             log.add("가져오기 실패: \(Self.describe(error))")
+        }
+    }
+
+    /// 보내기를 직접 시작한다. 엔진 상태에서 예약이 빠졌어도 로컬에 보낼 것(needsUpload)이 있으면 다시 넣고 보낸다.
+    /// 엔진이 없으면(테스트 실행 등) 아무것도 하지 않는다.
+    func sendNow() async {
+        guard let engine else { return }
+        log.add("지금 보내기 요청")
+        guard sendProgress.beginManualSend() else {
+            // 겹치면 같은 레코드의 보낸 정보가 덮어써진다. 다시 넣기·보내기를 하지 않는다.
+            log.add("보내기 진행 중, 건너뜀")
+            return
+        }
+        defer { sendProgress.endManualSend() }
+        do {
+            for change in try applier.pendingChanges() {
+                enqueue(change, in: engine)
+            }
+        } catch {
+            // 다시 넣지 못해도 엔진에 이미 있는 예약은 보낸다.
+            log.add("보낼 변경 읽기 실패: \(Self.describe(error))")
+        }
+        logPendingSummary(engine)
+        do {
+            // 성공하면 보낸 결과 이벤트에서 "보냄: …" 요약 줄이 남는다.
+            try await engine.sendChanges()
+        } catch {
+            log.add("보내기 실패: \(Self.describe(error))")
         }
     }
 
@@ -187,10 +238,14 @@ final class StampSyncEngine {
             if monitor.status == .syncing { monitor.status = .idle }
             log.add("가져오기 끝")
             Task { await retryFailedReceives() }
-        case .willSendChanges:
+        case .willSendChanges(let will):
             monitor.status = .syncing
+            sendProgress.engineWillSend()
+            log.add(SyncDiagnostics.sendStartLine(will.context.reason))
         case .didSendChanges:
             if monitor.status == .syncing { monitor.status = .idle }
+            sendProgress.engineDidSend()
+            log.add("보내기 끝")
             if !deferredSaves.isEmpty {
                 log.add("읽기 실패로 미룬 저장 \(deferredSaves.count)건 다시 예약")
                 engine.state.add(pendingRecordZoneChanges: deferredSaves.map { .saveRecord($0) })
@@ -521,6 +576,22 @@ final class StampSyncEngine {
     }
 }
 
+// MARK: - 보내기 묶음 로그
+
+extension StampSyncEngine {
+    /// 엔진이 보낼 레코드 묶음을 요청했다. 여기까지 왔는지로 우리 코드에서 멈췄는지 가린다.
+    fileprivate func logBatchRequest() {
+        log.add("보낼 묶음 요청 받음")
+    }
+
+    fileprivate func logBatch(_ batch: CKSyncEngine.RecordZoneChangeBatch?) {
+        log.add(SyncDiagnostics.batchSummary(
+            saves: batch?.recordsToSave.count ?? 0,
+            deletes: batch?.recordIDsToDelete.count ?? 0
+        ))
+    }
+}
+
 // MARK: - CKSyncEngineDelegate
 
 extension StampSyncEngine: CKSyncEngineDelegate {
@@ -532,11 +603,17 @@ extension StampSyncEngine: CKSyncEngineDelegate {
         _ context: CKSyncEngine.SendChangesContext,
         syncEngine: CKSyncEngine
     ) async -> CKSyncEngine.RecordZoneChangeBatch? {
+        await logBatchRequest()
         let scope = context.options.scope
         let changes = syncEngine.state.pendingRecordZoneChanges.filter { scope.contains($0) }
-        guard !changes.isEmpty else { return nil }
-        return await CKSyncEngine.RecordZoneChangeBatch(pendingChanges: changes) { recordID in
+        guard !changes.isEmpty else {
+            await logBatch(nil)
+            return nil
+        }
+        let batch = await CKSyncEngine.RecordZoneChangeBatch(pendingChanges: changes) { recordID in
             await self.recordToSave(recordID, engine: syncEngine)
         }
+        await logBatch(batch)
+        return batch
     }
 }
