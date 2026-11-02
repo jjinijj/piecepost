@@ -31,6 +31,8 @@ struct SyncMonitorTests {
         #expect(SyncStatus.idle.label == "정상")
         #expect(SyncStatus.syncing.label == "동기화 중")
         #expect(SyncStatus.iCloudUnavailable.label == "iCloud 꺼짐")
+        #expect(SyncStatus.iCloudTemporarilyUnavailable.label == "iCloud 일시 사용 불가")
+        #expect(SyncStatus.accountChanged.label == "계정 변경됨")
         #expect(SyncStatus.quotaExceeded.label == "용량 부족")
         #expect(SyncStatus.error(code: 4).label == "오류(4)")
     }

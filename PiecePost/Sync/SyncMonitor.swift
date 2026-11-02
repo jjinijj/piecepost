@@ -7,6 +7,9 @@ enum SyncStatus: Equatable {
     case idle
     case syncing
     case iCloudUnavailable
+    case iCloudTemporarilyUnavailable
+    /// 기억한 계정과 다른 Apple ID라 동기화를 멈춤
+    case accountChanged
     case quotaExceeded
     case error(code: Int)
 
@@ -16,6 +19,8 @@ enum SyncStatus: Equatable {
         case .idle: "정상"
         case .syncing: "동기화 중"
         case .iCloudUnavailable: "iCloud 꺼짐"
+        case .iCloudTemporarilyUnavailable: "iCloud 일시 사용 불가"
+        case .accountChanged: "계정 변경됨"
         case .quotaExceeded: "용량 부족"
         case .error(let code): "오류(\(code))"
         }
