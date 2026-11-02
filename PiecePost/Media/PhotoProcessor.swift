@@ -35,9 +35,12 @@ nonisolated enum PhotoProcessor {
 
     static func processSynchronously(_ original: Data) throws -> ProcessedPhoto {
         let oriented = try decodeOriented(original)
-        let square = try cropCenterSquare(oriented)
-        let photoImage = try resize(square, to: min(square.width, photoMaxPixel))
-        let thumbnailImage = try resize(photoImage, to: min(photoImage.width, thumbnailMaxPixel))
+        let photoImage = try drawCenterSquare(
+            oriented, to: min(oriented.width, oriented.height, photoMaxPixel)
+        )
+        let thumbnailImage = try drawCenterSquare(
+            photoImage, to: min(photoImage.width, thumbnailMaxPixel)
+        )
         return ProcessedPhoto(
             photo: try encodeHEIC(photoImage),
             thumbnail: try encodeHEIC(thumbnailImage)
@@ -70,37 +73,38 @@ nonisolated enum PhotoProcessor {
         return image
     }
 
-    private static func cropCenterSquare(_ image: CGImage) throws -> CGImage {
-        let side = min(image.width, image.height)
-        let rect = CGRect(
-            x: (image.width - side) / 2,
-            y: (image.height - side) / 2,
-            width: side,
-            height: side
-        )
-        guard let cropped = image.cropping(to: rect) else {
-            throw PhotoProcessorError.unreadableImage
-        }
-        return cropped
-    }
-
-    private static func resize(_ image: CGImage, to side: Int) throws -> CGImage {
+    /// 가운데 정사각형을 잘라 한 변 `side`로 줄인다. 자르기와 줄이기를 그리기 한 번으로 한다.
+    ///
+    /// `CGImage.cropping(to:)`를 쓰지 않는다. 시뮬레이터에서 EXIF 방향 6·8인 HEIC를 회전해 읽은
+    /// 이미지를 그것으로 자르면 아래 1/6이 비고 오른쪽에 검은 띠가 생겼다(docs/specs/photo-crop-band.md).
+    /// 대신 원본 전체를 캔버스에 그리되, 가운데 정사각형이 캔버스를 꼭 채우도록 위치·배율을 정해
+    /// 바깥 부분이 캔버스 밖으로 나가게 한다.
+    private static func drawCenterSquare(_ image: CGImage, to side: Int) throws -> CGImage {
         if image.width == side && image.height == side { return image }
+        let sourceSide = min(image.width, image.height)
 
         guard let context = makeContext(side: side, preferredColorSpace: image.colorSpace) else {
             throw PhotoProcessorError.encodingFailed
         }
-        let rect = CGRect(x: 0, y: 0, width: side, height: side)
+        let canvas = CGRect(x: 0, y: 0, width: side, height: side)
         // 투명 영역이 있는 이미지는 검게 나오지 않도록 흰 바탕을 깐다.
         context.setFillColor(CGColor(red: 1, green: 1, blue: 1, alpha: 1))
-        context.fill(rect)
+        context.fill(canvas)
         context.interpolationQuality = .high
-        context.draw(image, in: rect)
 
-        guard let resized = context.makeImage() else {
+        let scale = CGFloat(side) / CGFloat(sourceSide)
+        let drawRect = CGRect(
+            x: -CGFloat((image.width - sourceSide) / 2) * scale,
+            y: -CGFloat((image.height - sourceSide) / 2) * scale,
+            width: CGFloat(image.width) * scale,
+            height: CGFloat(image.height) * scale
+        )
+        context.draw(image, in: drawRect)
+
+        guard let result = context.makeImage() else {
             throw PhotoProcessorError.encodingFailed
         }
-        return resized
+        return result
     }
 
     /// 원본 색 공간(예: Display P3)을 유지한다. 그 색 공간으로 그릴 수 없으면 sRGB로 그린다.
