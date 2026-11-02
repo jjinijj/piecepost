@@ -195,7 +195,15 @@ private struct DecodedImage {
         let source = try #require(CGImageSourceCreateWithData(data as CFData, nil))
         type = try #require(CGImageSourceGetType(source) as String?)
         properties = (CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any]) ?? [:]
-        let image = try #require(CGImageSourceCreateImageAtIndex(source, 0, nil))
+        // 시뮬레이터에서 프로세스가 처음 하는 HEIC 디코딩이 CGImageSourceCreateImageAtIndex 로는
+        // 전부 검정으로 나오는 현상이 있어, 원본 크기 그대로 즉시 디코딩하는 썸네일 경로로 읽는다.
+        let pixelWidth = try #require(properties[kCGImagePropertyPixelWidth] as? Int)
+        let pixelHeight = try #require(properties[kCGImagePropertyPixelHeight] as? Int)
+        let image = try #require(CGImageSourceCreateThumbnailAtIndex(source, 0, [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceShouldCacheImmediately: true,
+            kCGImageSourceThumbnailMaxPixelSize: max(pixelWidth, pixelHeight),
+        ] as CFDictionary))
         let width = image.width
         let height = image.height
         self.width = width
