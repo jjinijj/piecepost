@@ -23,6 +23,7 @@ struct SyncSpikeView: View {
     @State private var errorMessage: String?
     @State private var isFetching = false
     @State private var isSending = false
+    @State private var isShowingSettings = false
 
     var body: some View {
         NavigationStack {
@@ -98,9 +99,19 @@ struct SyncSpikeView: View {
             }
             .navigationTitle("동기화 시험")
             .toolbar {
-                Button("만들기", systemImage: "plus") {
-                    isCreating = true
+                ToolbarItem(placement: .topBarLeading) {
+                    Button("설정", systemImage: "gearshape") {
+                        isShowingSettings = true
+                    }
                 }
+                ToolbarItem(placement: .primaryAction) {
+                    Button("만들기", systemImage: "plus") {
+                        isCreating = true
+                    }
+                }
+            }
+            .sheet(isPresented: $isShowingSettings) {
+                SettingsView(monitor: monitor)
             }
             .sheet(isPresented: $isCreating) {
                 CreateStampSheet(store: store)
