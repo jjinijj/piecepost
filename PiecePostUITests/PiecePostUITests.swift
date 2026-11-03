@@ -52,6 +52,30 @@ final class PiecePostUITests: XCTestCase {
         XCTAssertTrue(app.navigationBars["동기화 시험"].exists)
     }
 
+    /// 시험 화면 → 톱니 → 설정 화면(동기화 끈 실행이라 "확인하는 중") → 닫기로 돌아온다.
+    @MainActor
+    func testSettingsOpensAndCloses() throws {
+        let app = XCUIApplication()
+        app.launchArguments = ["-PiecePostDisableSync"]
+        app.launch()
+
+        let gear = app.buttons["설정"]
+        XCTAssertTrue(gear.waitForExistence(timeout: 5))
+        gear.tap()
+
+        XCTAssertTrue(app.navigationBars["설정"].waitForExistence(timeout: 5))
+        XCTAssertTrue(app.staticTexts["iCloud 백업"].exists)
+        XCTAssertTrue(app.staticTexts["정보"].exists)
+        XCTAssertTrue(app.staticTexts["버전"].exists)
+        let statusTitle = app.staticTexts["syncStatusTitle"]
+        XCTAssertTrue(statusTitle.exists)
+        XCTAssertEqual(statusTitle.label, "확인하는 중")
+
+        app.buttons["닫기"].tap()
+        XCTAssertTrue(app.navigationBars["동기화 시험"].waitForExistence(timeout: 5))
+        XCTAssertFalse(app.navigationBars["설정"].exists)
+    }
+
     @MainActor
     func testLaunchPerformance() throws {
         // This measures how long it takes to launch your application.
