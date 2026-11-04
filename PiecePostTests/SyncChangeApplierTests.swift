@@ -538,4 +538,63 @@ struct SyncChangeApplierTests {
         #expect(try applier.uploadValues(for: "2026-11-18") == nil)
         #expect(try applier.uploadValues(for: "2026-11-19") == nil)
     }
+
+    // MARK: 전부 지우기
+
+    @Test func eraseAllLocalRemovesEveryRowAndPhotoFile() throws {
+        // 올라간 우표, 업로드 대기 우표, 삭제 대기 우표, 우표가 가리키지 않는 남은 파일
+        try uploadedStamp(date: "2026-11-17")
+        try store.create(date: "2026-11-18", note: "대기", photo: localPhoto, now: created)
+        try uploadedStamp(date: "2026-11-19")
+        try store.delete(date: "2026-11-19")
+        let orphan = try fileStore.save(localPhoto)
+
+        #expect(try applier.eraseAllLocal() == 3)
+
+        #expect(try container.mainContext.fetch(FetchDescriptor<Stamp>()).isEmpty)
+        #expect(try applier.pendingChanges().isEmpty)
+        #expect(!fileExists(orphan.photoPath) && !fileExists(orphan.thumbnailPath))
+        for folder in [StampFileStore.photosFolder, StampFileStore.thumbnailsFolder] {
+            let url = fileStore.baseURL.appending(path: folder)
+            #expect(!FileManager.default.fileExists(atPath: url.path(percentEncoded: false)))
+        }
+    }
+
+    @Test func eraseAllLocalWithNothingIsHarmless() throws {
+        #expect(try applier.eraseAllLocal() == 0)
+    }
+
+    /// 사진 폴더를 지우지 못하면 성공으로 알리지 않는다. 다시 부르면 남은 파일을 지운다.
+    @Test func eraseAllLocalReportsPhotoFolderFailureAndRetries() throws {
+        let stamp = try uploadedStamp()
+        let photoURL = fileStore.url(for: stamp.photoPath)
+        let thumbnailPath = stamp.thumbnailPath
+        // 잠긴(immutable) 파일이 있으면 폴더를 지울 수 없다.
+        try FileManager.default.setAttributes([.immutable: true], ofItemAtPath: photoURL.path(percentEncoded: false))
+        defer {
+            try? FileManager.default.setAttributes([.immutable: false], ofItemAtPath: photoURL.path(percentEncoded: false))
+        }
+
+        #expect(throws: (any Error).self) { try applier.eraseAllLocal() }
+        // 행은 지워졌고, 다른 폴더(썸네일)는 지웠다.
+        #expect(try container.mainContext.fetch(FetchDescriptor<Stamp>()).isEmpty)
+        #expect(!fileExists(thumbnailPath))
+        #expect(FileManager.default.fileExists(atPath: photoURL.path(percentEncoded: false)))
+
+        try FileManager.default.setAttributes([.immutable: false], ofItemAtPath: photoURL.path(percentEncoded: false))
+        #expect(try applier.eraseAllLocal() == 0)
+        #expect(!FileManager.default.fileExists(atPath: photoURL.path(percentEncoded: false)))
+    }
+
+    /// 지운 뒤 새로 만들면 폴더를 다시 만들고 처음 올리는 우표가 된다.
+    @Test func stampCreatedAfterEraseAllUploadsAsNew() throws {
+        try uploadedStamp()
+        try applier.eraseAllLocal()
+
+        let stamp = try store.create(date: "2026-11-18", note: "새", photo: localPhoto, now: later)
+
+        #expect(stamp.systemFields == nil && stamp.needsUpload && stamp.photoNeedsUpload)
+        #expect(try fileData(stamp.photoPath) == localPhoto.photo)
+        #expect(try applier.pendingChanges() == [.save(date: "2026-11-18")])
+    }
 }
