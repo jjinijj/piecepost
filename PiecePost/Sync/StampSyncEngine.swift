@@ -54,6 +54,8 @@ final class StampSyncEngine {
     /// 지금 진행 중인 가져오기·보내기가 시작될 때의 `eraseFence.token`.
     private var fetchStartedAt = 0
     private var sendStartedAt = 0
+    /// 지우는 동안 받은 수정 이름. 성공해 로컬을 지운 뒤 다시 받는다(결정 4·8).
+    private var heldModifications = HeldFetchedModifications()
     /// '존 없음' 표시. 있는 동안 저장을 예약할 때 존 만들기도 함께 예약한다(결정 5·9).
     private var zoneMissingMarker: ZoneMissingMarker
 
@@ -354,7 +356,11 @@ final class StampSyncEngine {
         // 지우는 동안과 그 뒤에 겹친 보내기·받기 결과는 `eraseFence`가 가른다.
         eraseFence.begin()
         var erased = false
-        defer { eraseFence.end(erased: erased) }
+        defer {
+            eraseFence.end(erased: erased)
+            // 실패면 다시 받기 목록에 이미 모두 있다. 성공이면 `finishErase` 가 먼저 꺼내 갔다.
+            _ = heldModifications.release(erased: false)
+        }
         let requestedAt = accountGeneration.value
 
         // 이미 진행 중인 보내기·받기를 멈추고, 보낼 레코드 예약을 비운다. 지울 우표를 다시 올리지 않게.
@@ -434,14 +440,33 @@ final class StampSyncEngine {
         } catch {
             // 서버는 이미 비었다. 남은 예약은 비운다. 다시 누르면 서버에 0개라 바로 로컬 지우기를 다시 시도한다.
             forgetErasedRecords(zoneMissing: zoneMissing)
+            retryHeldModifications()
             log.add("전부 지우기: 서버는 지웠으나 로컬 삭제 실패: \(Self.describe(error))")
             return .failed
         }
         forgetErasedRecords(zoneMissing: zoneMissing)
+        retryHeldModifications()
         log.add("전부 지우기: 성공, 우표 \(count)장")
         // 화면용 로그를 비운다. 위 줄은 OSLog에만 남는다.
         log.clear()
         return .erased
+    }
+
+    /// 지우는 동안 받은 다른 기기의 수정을 다시 받기 목록에 넣고 다시 받는다. 지운 뒤(`forgetErasedRecords` 뒤)에 부른다.
+    /// 엔진의 변경 토큰은 이미 지나갔으므로 여기서 다시 받지 않으면 그 우표를 영영 받지 못한다.
+    /// 다시 받기는 지우기가 끝난 뒤(`eraseFence` 가 풀린 뒤) 돈다.
+    private func retryHeldModifications() {
+        let names = heldModifications.release(erased: true)
+        guard !names.isEmpty else { return }
+        for name in names {
+            do {
+                try retryList.add(name)
+            } catch {
+                log.add("다시 받기 목록 저장 실패: \(Self.describe(error))")
+            }
+        }
+        log.add("전부 지우기: 지우는 동안 받은 수정 \(names.count)건 다시 받기")
+        Task { await retryFailedReceives() }
     }
 
     /// 서버 존 `Stamps` 의 우표 레코드 ID 를 전부 얻는다. 처음부터(토큰 없이) 바뀐 것을 받아 ID 만 모은다.
@@ -712,10 +737,13 @@ final class StampSyncEngine {
         case .apply:
             break
         case .hold:
-            // 지우는 중에는 반영하지 않는다. 지우기가 실패하면 다시 받기로 반영하고, 성공하면 목록을 비운다.
-            let names = changes.modifications.map(\.record.recordID)
+            // 지우는 중에는 반영하지 않는다. 지우기가 실패하면 다시 받기로 반영한다.
+            // 성공하면 목록을 비우되, 수정은 따로 남겨 지운 뒤 다시 받는다(다른 기기의 정상 수정을 잃지 않게). 삭제는 버린다.
+            let modified = changes.modifications.map(\.record.recordID)
                 .filter { $0.zoneID == StampRecordMapper.zoneID }
                 .map(\.recordName)
+            heldModifications.hold(modified: modified)
+            let names = modified
                 + changes.deletions.filter { $0.recordType == StampRecordMapper.recordType }.map(\.recordID.recordName)
             for name in names {
                 do {
