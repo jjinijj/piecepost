@@ -76,6 +76,38 @@ final class PiecePostUITests: XCTestCase {
         XCTAssertFalse(app.navigationBars["설정"].exists)
     }
 
+    /// 동기화를 끈 실행("연결 전")에서는 "기록 전부 지우기"가 비활성이고 iCloud 이유 문구가 보인다.
+    @MainActor
+    func testEraseAllDisabledWithoutSync() throws {
+        let app = XCUIApplication()
+        app.launchArguments = ["-PiecePostDisableSync"]
+        app.launch()
+
+        let gear = app.buttons["설정"]
+        XCTAssertTrue(gear.waitForExistence(timeout: 5))
+        gear.tap()
+
+        XCTAssertTrue(app.navigationBars["설정"].waitForExistence(timeout: 5))
+        XCTAssertTrue(app.staticTexts["데이터"].exists)
+        let eraseAll = app.buttons["기록 전부 지우기"]
+        XCTAssertTrue(eraseAll.exists)
+        XCTAssertFalse(eraseAll.isEnabled)
+        let reason = app.staticTexts["eraseAllDisabledReason"]
+        XCTAssertTrue(reason.exists)
+        XCTAssertEqual(reason.label, "지금은 iCloud를 쓸 수 없어 지울 수 없어요.")
+
+        // "데이터"는 "iCloud 백업"과 "정보" 사이에 있다.
+        let backupY = app.staticTexts["iCloud 백업"].frame.minY
+        let dataY = app.staticTexts["데이터"].frame.minY
+        let infoY = app.staticTexts["정보"].frame.minY
+        XCTAssertLessThan(backupY, dataY)
+        XCTAssertLessThan(dataY, infoY)
+
+        // 비활성이라 눌러도 확인 창이 뜨지 않는다.
+        eraseAll.tap()
+        XCTAssertFalse(app.alerts.firstMatch.waitForExistence(timeout: 1))
+    }
+
     @MainActor
     func testLaunchPerformance() throws {
         // This measures how long it takes to launch your application.
