@@ -14,6 +14,7 @@ final class StampSyncEngine {
     private let monitor: SyncMonitor
     private let retryList: ReceiveRetryList
     private let accountStore: SyncAccountStore
+    private let zoneMissingStore: ZoneMissingMarkerStore
     private var engine: CKSyncEngine?
     private var container: CKContainer?
     private var database: CKDatabase?
@@ -48,14 +49,27 @@ final class StampSyncEngine {
     /// 멈춤·재개와 엔진의 계정 알림 때 올라간다. `await` 뒤 결과를 반영해도 되는지 가른다.
     private var accountGeneration = SyncAccountGeneration()
 
+    /// 기록 전부 지우기와 겹친 보내기·받기 결과를 반영할지 가른다. 겹친 지우기 요청도 막는다(화면도 버튼을 막는다).
+    private var eraseFence = EraseFence()
+    /// 지금 진행 중인 가져오기·보내기가 시작될 때의 `eraseFence.token`.
+    private var fetchStartedAt = 0
+    private var sendStartedAt = 0
+    /// 지우는 동안 받은 수정 이름. 성공해 로컬을 지운 뒤 다시 받는다(결정 4·8).
+    private var heldModifications = HeldFetchedModifications()
+    /// '존 없음' 표시. 있는 동안 저장을 예약할 때 존 만들기도 함께 예약한다(결정 5·9).
+    private var zoneMissingMarker: ZoneMissingMarker
+
     init(
         applier: SyncChangeApplier,
         stateStore: SyncStateStore = SyncStateStore(),
         retryList: ReceiveRetryList = ReceiveRetryList(),
         accountStore: SyncAccountStore = SyncAccountStore(),
+        zoneMissingStore: ZoneMissingMarkerStore = ZoneMissingMarkerStore(),
         monitor: SyncMonitor
     ) {
         self.applier = applier
+        self.zoneMissingStore = zoneMissingStore
+        self.zoneMissingMarker = ZoneMissingMarker(isSet: zoneMissingStore.load())
         self.stateStore = stateStore
         self.retryList = retryList
         self.accountStore = accountStore
@@ -320,6 +334,237 @@ final class StampSyncEngine {
         }
     }
 
+    // MARK: 기록 전부 지우기
+
+    /// 한 번에 지울 레코드 수. CloudKit 요청 하나의 항목 한도(400) 안.
+    private static let eraseBatchSize = 400
+
+    /// iCloud의 우표 레코드를 먼저 전부 지우고, 전부 지웠으면 이 기기의 우표·사진·화면 로그를 지운다(기획서 settings-erase-records 결정 1·2).
+    /// 존 `Stamps` 는 지우지 않는다. 지울 목록은 이 기기 로컬이 아니라 서버에서 얻는다(완료 기준 3).
+    /// 하나라도 못 지웠으면 이 기기는 지우지 않는다(결정 3). 엔진이 없거나 iCloud를 쓸 수 없으면 시도하지 않는다.
+    /// 로그에는 상태·개수·오류 코드만 남긴다. 레코드 이름(날짜)도 남기지 않는다(불변 규칙 8).
+    func eraseAll() async -> EraseAllResult {
+        guard let engine, let database else { return .failed }
+        guard !eraseFence.isErasing else {
+            log.add("전부 지우기: 진행 중, 건너뜀")
+            return .failed
+        }
+        guard !isPaused, statusState.account != .signedOut, statusState.account != .temporarilyUnavailable else {
+            log.add("전부 지우기: iCloud 사용 불가, 시도 안 함")
+            return .failed
+        }
+        // 지우는 동안과 그 뒤에 겹친 보내기·받기 결과는 `eraseFence`가 가른다.
+        eraseFence.begin()
+        var erased = false
+        defer {
+            eraseFence.end(erased: erased)
+            // 실패면 다시 받기 목록에 이미 모두 있다. 성공이면 `finishErase` 가 먼저 꺼내 갔다.
+            _ = heldModifications.release(erased: false)
+        }
+        let requestedAt = accountGeneration.value
+
+        // 이미 진행 중인 보내기·받기를 멈추고, 보낼 레코드 예약을 비운다. 지울 우표를 다시 올리지 않게.
+        // 실패하면 업로드 대기 표시(needsUpload)로 다시 넣는다. 존은 지우지 않으므로 존 예약은 그대로 둔다.
+        await engine.cancelOperations()
+        engine.state.remove(pendingRecordZoneChanges: engine.state.pendingRecordZoneChanges)
+
+        let outcome: RecordEraseOutcome
+        var zoneMissing = false
+        var firstFailure: (any Error)?
+        switch await serverStampRecordIDs(database) {
+        case .failure(let error) where (error as? CKError)?.code == .zoneNotFound:
+            // 서버에 존이 없다 = 레코드 0개(결정 9). 새 우표 때 존을 함께 만들게 표시한다.
+            zoneMissing = true
+            log.add("전부 지우기: 서버에 존 없음, 레코드 0개로 봄")
+            outcome = .erased
+        case .failure(let error):
+            firstFailure = error
+            outcome = RecordEraseOutcome.outcome(forListingFailure: error)
+        case .success(let ids):
+            log.add("전부 지우기: 서버 레코드 \(ids.count)개 삭제 요청")
+            let results = await deleteRecords(ids, in: database)
+            for case .failure(let error) in results.values where (error as? CKError)?.code != .unknownItem {
+                firstFailure = error
+                break
+            }
+            outcome = RecordEraseOutcome.outcome(requested: ids, results: results)
+        }
+
+        // 기다리는 사이 계정이 바뀌었으면 어느 계정의 레코드를 지웠는지 확신할 수 없다. 로컬은 지우지 않는다.
+        guard accountGeneration.value == requestedAt else {
+            log.add("전부 지우기: 기다리는 중 계정 바뀜, 로컬 지우지 않음")
+            restoreAfterEraseFailure()
+            return .failed
+        }
+
+        let effect: EraseFailureEffect
+        let result: EraseAllResult
+        switch outcome {
+        case .failed(let failedEffect):
+            effect = failedEffect
+            result = .failed
+        case .partial(let partialEffect):
+            effect = partialEffect
+            result = .partial
+        case .erased:
+            erased = true
+            return await finishErase(engine: engine, zoneMissing: zoneMissing)
+        }
+        log.add("전부 지우기 \(result == .partial ? "일부만 지움" : "실패"), 로컬 지우지 않음: \(firstFailure.map(Self.describe) ?? "결과 없음")")
+        switch effect {
+        case .none: break
+        case .signedOut: setAccount(.signedOut)
+        case .quotaExceeded: statusState.isQuotaExceeded = true
+        }
+        restoreAfterEraseFailure()
+        return result
+    }
+
+    /// 서버 레코드를 다 지운 뒤. 자기 삭제를 받아 버리고 로컬을 지운다. 아직 지우는 중(`eraseFence.isErasing`)일 때 부른다.
+    private func finishErase(engine: CKSyncEngine, zoneMissing: Bool) async -> EraseAllResult {
+        // 이 기기가 한 삭제가 나중 가져오기로 돌아오면, 지운 직후 같은 날짜로 만든 새 우표를 지울 수 있다(삭제 우선).
+        // 지우는 중(hold) 상태로 한 번 가져와 받아 버린다. 받은 변경은 다시 받기 목록에 들어갔다가 아래에서 비워진다(결정 8).
+        if !zoneMissing {
+            do {
+                try await engine.fetchChanges()
+                log.add("전부 지우기: 자기 삭제 받아 버림")
+            } catch {
+                log.add("전부 지우기: 자기 삭제 가져오기 실패, 지우기는 계속: \(Self.describe(error))")
+            }
+        }
+        // 기다리는 동안 엔진이 새로 시작한 작업도 멈춘 뒤 로컬을 지운다.
+        await engine.cancelOperations()
+        let count: Int
+        do {
+            count = try applier.eraseAllLocal()
+        } catch {
+            // 서버는 이미 비었다. 남은 예약은 비운다. 다시 누르면 서버에 0개라 바로 로컬 지우기를 다시 시도한다.
+            forgetErasedRecords(zoneMissing: zoneMissing)
+            retryHeldModifications()
+            log.add("전부 지우기: 서버는 지웠으나 로컬 삭제 실패: \(Self.describe(error))")
+            return .failed
+        }
+        forgetErasedRecords(zoneMissing: zoneMissing)
+        retryHeldModifications()
+        log.add("전부 지우기: 성공, 우표 \(count)장")
+        // 화면용 로그를 비운다. 위 줄은 OSLog에만 남는다.
+        log.clear()
+        return .erased
+    }
+
+    /// 지우는 동안 받은 다른 기기의 수정을 다시 받기 목록에 넣고 다시 받는다. 지운 뒤(`forgetErasedRecords` 뒤)에 부른다.
+    /// 엔진의 변경 토큰은 이미 지나갔으므로 여기서 다시 받지 않으면 그 우표를 영영 받지 못한다.
+    /// 다시 받기는 지우기가 끝난 뒤(`eraseFence` 가 풀린 뒤) 돈다.
+    private func retryHeldModifications() {
+        let names = heldModifications.release(erased: true)
+        guard !names.isEmpty else { return }
+        for name in names {
+            do {
+                try retryList.add(name)
+            } catch {
+                log.add("다시 받기 목록 저장 실패: \(Self.describe(error))")
+            }
+        }
+        log.add("전부 지우기: 지우는 동안 받은 수정 \(names.count)건 다시 받기")
+        Task { await retryFailedReceives() }
+    }
+
+    /// 서버 존 `Stamps` 의 우표 레코드 ID 를 전부 얻는다. 처음부터(토큰 없이) 바뀐 것을 받아 ID 만 모은다.
+    /// 쿼리가 아니라서 인덱스가 필요 없고, 이 기기가 아직 받지 못한 레코드도 들어간다.
+    private func serverStampRecordIDs(_ database: CKDatabase) async -> Result<[CKRecord.ID], any Error> {
+        var ids: [CKRecord.ID] = []
+        var token: CKServerChangeToken?
+        do {
+            while true {
+                let page = try await database.recordZoneChanges(
+                    inZoneWith: StampRecordMapper.zoneID,
+                    since: token,
+                    desiredKeys: []
+                )
+                for (id, result) in page.modificationResultsByID {
+                    // 받기에 실패한 레코드도 지울 목록에 넣는다. 존 `Stamps` 에는 우표만 있다.
+                    if case .success(let modification) = result,
+                       modification.record.recordType != StampRecordMapper.recordType {
+                        continue
+                    }
+                    ids.append(id)
+                }
+                token = page.changeToken
+                if !page.moreComing { break }
+            }
+        } catch {
+            return .failure(error)
+        }
+        return .success(ids)
+    }
+
+    /// 레코드를 묶음으로 나눠 지운다. 한 묶음이 실패해도 다음 묶음은 계속 지운다(남은 것만 다시 지울 수 있게).
+    private func deleteRecords(
+        _ ids: [CKRecord.ID],
+        in database: CKDatabase
+    ) async -> [CKRecord.ID: Result<Void, any Error>] {
+        var results: [CKRecord.ID: Result<Void, any Error>] = [:]
+        var start = 0
+        while start < ids.count {
+            let batch = Array(ids[start..<min(start + Self.eraseBatchSize, ids.count)])
+            start += batch.count
+            do {
+                let (_, deleteResults) = try await database.modifyRecords(
+                    saving: [],
+                    deleting: batch,
+                    atomically: false
+                )
+                results.merge(deleteResults) { _, new in new }
+            } catch {
+                results.merge(RecordEraseOutcome.results(forThrown: error, requested: batch)) { _, new in new }
+            }
+        }
+        return results
+    }
+
+    private func saveZoneMissingMarker() {
+        do {
+            try zoneMissingStore.save(zoneMissingMarker.isSet)
+        } catch {
+            log.add("존 없음 표시 저장 실패: \(Self.describe(error))")
+        }
+    }
+
+    /// 지우기 실패. 비웠던 보낼 예약을 업로드 대기 표시로 다시 넣고, 지우는 동안 반영하지 않은 받은 변경을 다시 받는다.
+    private func restoreAfterEraseFailure() {
+        guard !isPaused, let engine else { return }
+        enqueueAllPending(in: engine, logPrefix: "전부 지우기 실패, 보낼 변경 다시")
+        Task { await retryFailedReceives() }
+    }
+
+    /// 지운 우표에 대해 남은 레코드 예약·미룬 저장·다시 받기 목록을 비운다. 로컬 우표를 다 지운 뒤에 부른다.
+    /// 남겨 두면 지운 우표를 다시 올리거나, 나중에 같은 날짜의 새 우표를 "서버에 없음"으로 지울 수 있다.
+    /// - Parameter zoneMissing: 서버에 존이 없다. '존 없음' 표시를 세워, 새 우표를 보낼 때 존 만들기를 함께 예약한다
+    private func forgetErasedRecords(zoneMissing: Bool) {
+        if let engine {
+            engine.state.remove(pendingRecordZoneChanges: engine.state.pendingRecordZoneChanges)
+        }
+        if zoneMissing {
+            zoneMissingMarker.set()
+            saveZoneMissingMarker()
+            log.add("존 없음 표시 세움")
+        }
+        deferredSaves.removeAll()
+        do {
+            try retryList.remove(retryList.names())
+        } catch {
+            log.add("다시 받기 목록 저장 실패: \(Self.describe(error))")
+        }
+    }
+
+    /// 서버에서 존이 지워졌다. 지워진 존에 대한 예약(존 예약 포함)을 비우고 '존 없음' 표시를 세운다.
+    private func forgetErasedZone() {
+        if let engine {
+            engine.state.remove(pendingDatabaseChanges: engine.state.pendingDatabaseChanges)
+        }
+        forgetErasedRecords(zoneMissing: true)
+    }
+
     // MARK: 로컬 변경
 
     /// `StampStore.onLocalChange`에서 부른다.
@@ -335,6 +580,10 @@ final class StampSyncEngine {
     }
 
     private func enqueue(_ change: PendingStampChange, in engine: CKSyncEngine) {
+        if zoneMissingMarker.needsZoneSave(for: change) {
+            // 서버에 존이 없다. 존 만들기를 함께 보내 `zoneNotFound` 를 거치지 않게 한다(결정 5·9).
+            engine.state.add(pendingDatabaseChanges: [.saveZone(CKRecordZone(zoneID: StampRecordMapper.zoneID))])
+        }
         switch change {
         case .save(let date):
             let id = StampRecordMapper.recordID(for: date)
@@ -351,8 +600,8 @@ final class StampSyncEngine {
     // MARK: 보내기
 
     fileprivate func recordToSave(_ recordID: CKRecord.ID, engine: CKSyncEngine) -> CKRecord? {
-        // 묶음을 만드는 사이 멈췄으면 넣지 않는다. 예약은 멈출 때 이미 비웠고 needsUpload 는 남아 있다.
-        guard !isPaused else { return nil }
+        // 묶음을 만드는 사이 멈췄거나 전부 지우기가 시작됐으면 넣지 않는다. 예약은 이미 비웠고 needsUpload 는 남아 있다.
+        guard !isPaused, !eraseFence.isErasing else { return nil }
         let values: StampUploadValues?
         do {
             values = try StampRecordMapper.date(from: recordID).flatMap(applier.uploadValues(for:))
@@ -391,8 +640,9 @@ final class StampSyncEngine {
 
         case .fetchedDatabaseChanges(let changes):
             for deletion in changes.deletions where deletion.zoneID == StampRecordMapper.zoneID {
-                // 합의: 로그만 남기고 로컬은 유지한다.
-                log.add("서버에서 존 삭제됨 reason=\(deletion.reason), 로컬 유지")
+                // 앱은 존을 지우지 않으므로 존 삭제는 언제나 이 기기 밖의 일이다(iCloud 설정에서 앱 데이터 삭제 등).
+                // 전부 지우기와 겹쳐도 서버에 존이 없다는 사실은 같아 `eraseFence` 와 상관없이 반영한다(결정 5).
+                applyZoneDeletion(reason: deletion.reason)
             }
 
         case .fetchedRecordZoneChanges(let changes):
@@ -402,6 +652,11 @@ final class StampSyncEngine {
             if !sent.savedZones.isEmpty {
                 log.add("존 저장됨 \(sent.savedZones.count)개")
             }
+            let stampsZoneSaved = sent.savedZones.contains { $0.zoneID == StampRecordMapper.zoneID }
+            if zoneMissingMarker.zonesSaved(containsStampsZone: stampsZoneSaved) {
+                saveZoneMissingMarker()
+                log.add("존 없음 표시 지움: 존 저장됨")
+            }
             for failure in sent.failedZoneSaves {
                 log.add("존 저장 실패: \(Self.describe(failure.error))")
             }
@@ -410,6 +665,7 @@ final class StampSyncEngine {
             applySent(sent, engine: engine)
 
         case .willFetchChanges:
+            fetchStartedAt = eraseFence.token
             statusState.isSyncing = true
             statusState.errorCode = nil
             log.add("가져오기 시작")
@@ -419,6 +675,7 @@ final class StampSyncEngine {
             rememberAccountAfterSyncIfNeeded()
             Task { await retryFailedReceives() }
         case .willSendChanges(let will):
+            sendStartedAt = eraseFence.token
             statusState.isSyncing = true
             statusState.errorCode = nil
             sendProgress.engineWillSend()
@@ -428,6 +685,11 @@ final class StampSyncEngine {
             sendProgress.engineDidSend()
             log.add("보내기 끝")
             rememberAccountAfterSyncIfNeeded()
+            switch eraseFence.gate(startedAt: sendStartedAt) {
+            case .apply: break
+            case .hold: return  // 지우기가 실패하면 업로드 대기 표시로 다시 넣는다
+            case .drop: deferredSaves.removeAll()  // 지운 우표의 예약
+            }
             if !deferredSaves.isEmpty {
                 log.add("읽기 실패로 미룬 저장 \(deferredSaves.count)건 다시 예약")
                 engine.state.add(pendingRecordZoneChanges: deferredSaves.map { .saveRecord($0) })
@@ -469,6 +731,31 @@ final class StampSyncEngine {
         guard !isPaused else {
             // 다른 계정의 데이터가 로컬과 섞이지 않게 한다. 원래 계정으로 돌아오면 엔진이 처음부터 다시 받는다.
             log.add("계정 변경됨, 받은 변경 반영 안 함: 변경 \(changes.modifications.count), 삭제 \(changes.deletions.count)")
+            return
+        }
+        switch eraseFence.gate(startedAt: fetchStartedAt) {
+        case .apply:
+            break
+        case .hold:
+            // 지우는 중에는 반영하지 않는다. 지우기가 실패하면 다시 받기로 반영한다.
+            // 성공하면 목록을 비우되, 수정은 따로 남겨 지운 뒤 다시 받는다(다른 기기의 정상 수정을 잃지 않게). 삭제는 버린다.
+            let modified = changes.modifications.map(\.record.recordID)
+                .filter { $0.zoneID == StampRecordMapper.zoneID }
+                .map(\.recordName)
+            heldModifications.hold(modified: modified)
+            let names = modified
+                + changes.deletions.filter { $0.recordType == StampRecordMapper.recordType }.map(\.recordID.recordName)
+            for name in names {
+                do {
+                    try retryList.add(name)
+                } catch {
+                    log.add("다시 받기 목록 저장 실패: \(Self.describe(error))")
+                }
+            }
+            log.add("전부 지우는 중, 받은 변경 \(names.count)건 반영 보류")
+            return
+        case .drop:
+            log.add("전부 지우기 전에 시작한 가져오기, 받은 변경 버림: 변경 \(changes.modifications.count), 삭제 \(changes.deletions.count)")
             return
         }
         var inserted = 0, updated = 0, conflicts = 0, skippedDeletion = 0, deleted = 0, failed = 0, retryLater = 0
@@ -525,6 +812,28 @@ final class StampSyncEngine {
         )
     }
 
+    /// 서버에서 존이 지워졌다(`deleted`·`purged`, iCloud 설정에서 앱 데이터를 지운 경우 등). 이 기기도 지운다(결정 5).
+    /// 로그에는 이유와 개수만 남긴다.
+    private func applyZoneDeletion(reason: CKDatabase.DatabaseChange.Deletion.Reason) {
+        switch ZoneDeletionAction.action(for: reason, isPaused: isPaused) {
+        case .ignoreWhilePaused:
+            log.add("서버에서 존 삭제됨 reason=\(reason), 계정 변경됨, 반영 안 함")
+        case .keepLocal:
+            log.add("서버에서 존 삭제됨 reason=\(reason), 로컬 유지")
+        case .eraseLocal:
+            do {
+                let count = try applier.eraseAllLocal()
+                forgetErasedZone()
+                log.add("서버에서 존 삭제됨 reason=\(reason), 로컬 우표 \(count)장 지움")
+            } catch {
+                // 서버 존은 이미 없다. 이 기기 지우기의 로컬 삭제 실패와 같게, 지워진 존의 예약을 비우고 '존 없음' 표시를 세운다.
+                // (행은 지우고 사진 폴더에서 실패했으면 로컬이 이미 비어, 표시가 없으면 새 우표가 zoneNotFound 를 거친다)
+                forgetErasedZone()
+                log.add("서버에서 존 삭제됨 reason=\(reason), 로컬 삭제 실패: \(Self.describe(error))")
+            }
+        }
+    }
+
     /// 받기 충돌 결과에 맞게 엔진의 보낼 목록을 맞춘다. 로그에는 상태만 남긴다(날짜·내용 금지).
     private func followUpReceive(_ outcome: ReceiveOutcome, recordID: CKRecord.ID) {
         switch outcome {
@@ -559,6 +868,8 @@ final class StampSyncEngine {
         guard let database else { return }
         // 멈춘 동안 다시 받으면 새 계정에서 받게 된다. 목록은 남겨 두고 재개 때 다시 받는다.
         guard !isPaused else { return }
+        // 지우는 동안은 다시 받지 않는다. 실패하면 지우기가 다시 부르고, 성공하면 목록이 비워진다.
+        guard !eraseFence.isErasing else { return }
         guard !isRetryingReceives else {
             receiveRetryRequestedWhileRunning = true
             return
@@ -578,6 +889,7 @@ final class StampSyncEngine {
         log.add("반영 실패 \(names.count)건 다시 받기")
         let ids = names.map { CKRecord.ID(recordName: $0, zoneID: StampRecordMapper.zoneID) }
         let requestedAt = accountGeneration.value
+        let startedAt = eraseFence.token
         let results: [CKRecord.ID: Result<CKRecord, any Error>]
         do {
             results = try await database.records(for: ids)
@@ -589,6 +901,11 @@ final class StampSyncEngine {
         // 하나도 반영·삭제하지 않고 목록을 그대로 둔다. 재개·다음 가져오기 끝에 다시 받는다.
         guard accountGeneration.allowsApplying(requestedAt: requestedAt, isPaused: isPaused) else {
             log.add("계정 변경됨, 다시 받기 결과 버림")
+            return
+        }
+        // 기다리는 사이 전부 지우기가 시작됐거나 끝났으면 지운 데이터의 결과일 수 있다. 목록은 그대로 둔다.
+        guard eraseFence.gate(startedAt: startedAt) == .apply else {
+            log.add("전부 지우기와 겹침, 다시 받기 결과 버림")
             return
         }
 
@@ -633,6 +950,14 @@ final class StampSyncEngine {
     // MARK: 보낸 결과
 
     private func applySent(_ sent: CKSyncEngine.Event.SentRecordZoneChanges, engine: CKSyncEngine) {
+        let gate = eraseFence.gate(startedAt: sendStartedAt)
+        if gate == .drop {
+            // 지운 우표의 결과. 같은 날짜로 새로 만든 우표에 옛 시스템 필드가 붙거나 존이 다시 만들어지지 않게 버린다.
+            for record in sent.savedRecords { sentInfo.removeValue(forKey: record.recordID) }
+            for failure in sent.failedRecordSaves { sentInfo.removeValue(forKey: failure.record.recordID) }
+            log.add("전부 지우기 전에 시작한 보내기, 결과 버림")
+            return
+        }
         var saved = 0, ignored = 0
         for record in sent.savedRecords {
             let id = record.recordID
@@ -658,14 +983,21 @@ final class StampSyncEngine {
             markDeleted(id)
         }
 
-        for failure in sent.failedRecordSaves {
-            let id = failure.record.recordID
-            let info = sentInfo.removeValue(forKey: id)
-            handleFailedSave(id: id, error: failure.error, sentInfo: info, engine: engine)
-        }
+        if gate == .hold {
+            // 지우는 중에는 실패를 처리하지 않는다(존을 다시 만들거나 다시 보내지 않게). 업로드 대기 표시는 남아 있어
+            // 지우기가 실패하면 다시 보낸다.
+            for failure in sent.failedRecordSaves { sentInfo.removeValue(forKey: failure.record.recordID) }
+            log.add("전부 지우는 중, 보내기 실패 \(sent.failedRecordSaves.count + sent.failedRecordDeletes.count)건 처리 안 함")
+        } else {
+            for failure in sent.failedRecordSaves {
+                let id = failure.record.recordID
+                let info = sentInfo.removeValue(forKey: id)
+                handleFailedSave(id: id, error: failure.error, sentInfo: info, engine: engine)
+            }
 
-        for (id, error) in sent.failedRecordDeletes {
-            handleFailedDelete(id: id, error: error)
+            for (id, error) in sent.failedRecordDeletes {
+                handleFailedDelete(id: id, error: error)
+            }
         }
 
         // 용량 부족 실패가 없고 하나라도 올라갔으면 "용량 부족"을 푼다.
@@ -812,8 +1144,12 @@ extension StampSyncEngine {
         log.add("보낼 묶음 요청 받음")
     }
 
-    /// 계정 변경으로 멈췄으면 로그를 남기고 true.
+    /// 계정 변경으로 멈췄거나 전부 지우는 중이면 로그를 남기고 true.
     fileprivate func isSendingPaused() -> Bool {
+        if eraseFence.isErasing {
+            log.add("전부 지우는 중, 보낼 묶음 없음")
+            return true
+        }
         guard isPaused else { return false }
         log.add("계정 변경됨, 보낼 묶음 없음")
         return true

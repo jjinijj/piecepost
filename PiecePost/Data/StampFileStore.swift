@@ -70,6 +70,23 @@ nonisolated final class StampFileStore: Sendable {
         }
     }
 
+    /// 사진·썸네일 폴더를 통째로 지운다. 우표 행이 가리키지 않는 남은 파일까지 지운다(기록 전부 지우기).
+    /// 다음에 저장할 때 폴더를 다시 만든다. 없는 폴더는 무시하고, 그 밖의 삭제 실패는 던진다
+    /// (사진이 남았는데 다 지웠다고 알리지 않게). 한 폴더가 실패해도 다른 폴더는 지운다.
+    func removeAllFiles() throws {
+        var firstError: (any Error)?
+        for folder in [Self.photosFolder, Self.thumbnailsFolder] {
+            let url = baseURL.appending(path: folder, directoryHint: .isDirectory)
+            guard FileManager.default.fileExists(atPath: url.path(percentEncoded: false)) else { continue }
+            do {
+                try FileManager.default.removeItem(at: url)
+            } catch {
+                firstError = firstError ?? error
+            }
+        }
+        if let firstError { throw firstError }
+    }
+
     private func write(_ data: Data, to relativePath: String) throws {
         let fileURL = url(for: relativePath)
         try FileManager.default.createDirectory(

@@ -29,4 +29,9 @@ final class SyncLog {
             entries.removeLast(entries.count - Self.maxEntries)
         }
     }
+
+    /// 화면용 항목을 모두 지운다(기록 전부 지우기). OSLog에 이미 남은 줄은 앱이 지울 수 없다.
+    func clear() {
+        entries.removeAll()
+    }
 }

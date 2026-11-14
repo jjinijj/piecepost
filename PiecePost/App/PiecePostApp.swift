@@ -43,7 +43,9 @@ struct PiecePostApp: App {
                 store: stampStore,
                 monitor: syncMonitor,
                 fetchNow: { [syncEngine] in await syncEngine?.fetchNow() },
-                sendNow: { [syncEngine] in await syncEngine?.sendNow() }
+                sendNow: { [syncEngine] in await syncEngine?.sendNow() },
+                // 엔진이 없으면(동기화를 끈 실행) iCloud를 지울 수 없으므로 실패로 본다.
+                eraseAll: { [syncEngine] in await syncEngine?.eraseAll() ?? .failed }
             )
         }
         .modelContainer(modelContainer)

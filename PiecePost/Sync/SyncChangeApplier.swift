@@ -139,6 +139,22 @@ final class SyncChangeApplier {
         return true
     }
 
+    /// 로컬 우표를 전부 지운다. 업로드 대기·삭제 대기 행도 지우고(삭제 우선), 사진·썸네일 폴더도 비운다.
+    /// 기록 전부 지우기(서버 레코드를 모두 지운 뒤)와 서버에서 존이 지워졌을 때(`deleted`·`purged`) 쓴다.
+    /// 행 삭제를 저장하지 못하면 되돌리고 파일도 지우지 않는다.
+    /// 행은 지웠는데 사진 폴더를 지우지 못하면 오류를 던진다. 다시 부르면 남은 폴더를 다시 지운다.
+    /// - Returns: 지운 행 수
+    @discardableResult
+    func eraseAllLocal() throws -> Int {
+        let stamps = try context.fetch(FetchDescriptor<Stamp>())
+        for stamp in stamps {
+            context.delete(stamp)
+        }
+        try save()
+        try fileStore.removeAllFiles()
+        return stamps.count
+    }
+
     // MARK: 보낸 결과
 
     /// 저장 성공. 보낸 뒤에 로컬이 또 바뀌었으면 `needsUpload`를 유지해 다시 보내게 한다.

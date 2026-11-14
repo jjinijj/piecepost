@@ -10,6 +10,8 @@ struct SyncSpikeView: View {
     let fetchNow: () async -> Void
     /// 엔진 상태에서 보내기 예약이 빠졌을 때 수동으로 다시 보낸다.
     let sendNow: () async -> Void
+    /// 설정 화면의 기록 전부 지우기
+    let eraseAll: () async -> EraseAllResult
 
     @Query(
         filter: #Predicate<Stamp> { !$0.pendingDeletion },
@@ -111,7 +113,7 @@ struct SyncSpikeView: View {
                 }
             }
             .sheet(isPresented: $isShowingSettings) {
-                SettingsView(monitor: monitor)
+                SettingsView(monitor: monitor, eraseAll: eraseAll)
             }
             .sheet(isPresented: $isCreating) {
                 CreateStampSheet(store: store)
@@ -178,6 +180,6 @@ private struct StampRow: View {
         for: Stamp.self,
         configurations: ModelConfiguration(isStoredInMemoryOnly: true, cloudKitDatabase: .none)
     )
-    SyncSpikeView(store: StampStore(context: container.mainContext), monitor: SyncMonitor(), fetchNow: {}, sendNow: {})
+    SyncSpikeView(store: StampStore(context: container.mainContext), monitor: SyncMonitor(), fetchNow: {}, sendNow: {}, eraseAll: { .failed })
         .modelContainer(container)
 }
